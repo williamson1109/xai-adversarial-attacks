@@ -1,0 +1,17 @@
+training:
+  batch_size: 16
+  epochs: 3               # reduced from 10 for quicker testing
+  learning_rate: 0.00003
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  patience: 3
+  min_delta: 0.001
+
+cross_validation:
+  n_repeats: 2            #reduced from 5 for quicker testing
+  n_splits: 2
+  seed: 42
+
+model:
+  dropout: 0.3

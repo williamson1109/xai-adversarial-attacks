@@ -1,0 +1,34 @@
+# LIAR Dataset Configuration
+dataset:
+  name: "LIAR"
+  hf_dataset_name: "liar"
+  
+paths:
+  base_dir: "data/LIAR"
+  raw_data: "data/LIAR/data/raw"
+  processed_data: "data/LIAR/data/processed"
+  attacked_data: "data/LIAR/data/attacked"
+  model_dir: "data/LIAR/models/BERT"
+  checkpoints: "data/LIAR/models/BERT/checkpoints"
+  finetuned_model: "data/LIAR/models/BERT/finetuned"
+  results_dir: "data/LIAR/results"
+  logs_dir: "data/LIAR/logs"
+
+preprocessing:
+  seed: 42
+  drop_ambiguous: true
+  label_mapping:
+    true: 0
+    mostly-true: 0
+    half-true: null
+    barely-true: 1
+    false: 1
+    pants-fire: 1
+  remove_duplicates: true
+  
+model:
+  name: "distilbert-base-uncased"
+  num_labels: 2
+  max_length: 250
+  freeze_base: true
+  unfreeze_last_n_layers: 2 
