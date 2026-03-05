@@ -1,0 +1,40 @@
+{
+  "SWR": {
+    "summary": {},
+    "num_attack_examples": 0
+  },
+  "SWI": {
+    "summary": {},
+    "num_attack_examples": 0
+  },
+  "SS": {
+    "summary": {},
+    "num_attack_examples": 0
+  },
+  "BT": {
+    "summary": {
+      "ae": 0.0,
+      "ci_mean": 3.293103448275862,
+      "ci_std": 1.7420620034261733,
+      "pi_mean": 3.1742573522271527,
+      "pi_std": 2.295806842945548,
+      "as_mean": -0.0001203027264825229,
+      "as_std": 0.0010935287667492536,
+      "num_samples": 58
+    },
+    "num_attack_examples": 58
+  },
+  "RWR": {
+    "summary": {
+      "ae": 0.0,
+      "ci_mean": 9.6,
+      "ci_std": 3.9089640571384123,
+      "pi_mean": 9.789077995460971,
+      "pi_std": 4.867982233435886,
+      "as_mean": -4.025578498840332e-05,
+      "as_std": 0.0014225794412335891,
+      "num_samples": 100
+    },
+    "num_attack_examples": 100
+  }
+}
