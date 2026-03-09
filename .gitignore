@@ -28,3 +28,6 @@ data/LIAR/data/processed/liar_orignial.csv
 data/LIAR/data/processed/test_binary.csv
 data/LIAR/data/processed/train_binary_augmented.csv
 data/LIAR/data/processed/val_binary.csv
+data/LIAR/data/processed/liar_original.csv
+data/LIAR/data/processed/train_binary.csv
+data/processed/liar_binary.csv
