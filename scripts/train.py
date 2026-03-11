@@ -1,65 +1,243 @@
 import argparse
 import os
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedKFold
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    accuracy_score, balanced_accuracy_score
+)
 from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+)
 
-def load_data(csv_path):
-    df = pd.read_csv(csv_path)
-    return df['statement'].tolist(), df['label'].tolist()
+
+# ---------------------------------------------------------------------------
+# Label mapping (confirmed from raw LIAR dataset):
+#   0 = false  →  binary FAKE (0)
+#   5 = pants-fire  →  binary FAKE (0)
+#   2 = mostly-true  →  binary REAL (1)
+#   3 = true  →  binary REAL (1)
+#   1 = half-true  →  DROPPED
+#   4 = barely-true  →  DROPPED
+# ---------------------------------------------------------------------------
+
+ID2LABEL = {0: "FAKE", 1: "REAL"}
+LABEL2ID = {"FAKE": 0, "REAL": 1}
+MAX_TOKENS = 250   # Match Kozik et al. (they used 250 tokens)
+
+
+def load_data(csv_path: str) -> pd.DataFrame:
+    """Load preprocessed binary LIAR CSV, dropping original_label if present."""
+    df = pd.read_csv(csv_path, usecols=lambda c: c != "original_label")
+    assert "statement" in df.columns, "Expected a 'statement' column in the CSV."
+    assert "label" in df.columns, "Expected a 'label' column in the CSV."
+    print(f"Loaded {len(df)} samples.")
+    print(f"Class distribution:\n{df['label'].value_counts().to_string()}\n")
+    return df[["statement", "label"]].reset_index(drop=True)
+
 
 def tokenize_function(examples, tokenizer):
-    return tokenizer(examples['statement'], truncation=True, padding='max_length', max_length=128)
+    return tokenizer(
+        examples["statement"],
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_TOKENS,
+    )
 
-def main(args):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_name = args.model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
 
-    texts, labels = load_data(args.train_csv)
-    df = pd.DataFrame({'statement': texts, 'label': labels})
-    train_df, val_df = train_test_split(df, test_size=0.1, random_state=42, stratify=labels)
-    train_ds = Dataset.from_pandas(train_df)
-    val_ds = Dataset.from_pandas(val_df)
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "accuracy":          accuracy_score(labels, preds),
+        "balanced_accuracy": balanced_accuracy_score(labels, preds),
+        "precision_macro":   precision_score(labels, preds, average="macro", zero_division=0),
+        "recall_macro":      recall_score(labels, preds, average="macro", zero_division=0),
+        "f1_macro":          f1_score(labels, preds, average="macro", zero_division=0),
+        "precision_fake":    precision_score(labels, preds, pos_label=0, zero_division=0),
+        "recall_fake":       recall_score(labels, preds, pos_label=0, zero_division=0),
+        "f1_fake":           f1_score(labels, preds, pos_label=0, zero_division=0),
+        "precision_real":    precision_score(labels, preds, pos_label=1, zero_division=0),
+        "recall_real":       recall_score(labels, preds, pos_label=1, zero_division=0),
+        "f1_real":           f1_score(labels, preds, pos_label=1, zero_division=0),
+    }
+
+
+def build_model(model_name: str, device: str):
+    """
+    Build DistilBERT with a classification head.
+    Following Kozik et al., the DistilBERT base is FROZEN —
+    only the classification head is trained.
+    """
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=2,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
+
+    # Freeze the DistilBERT encoder — train classification head only
+    # (matches Kozik et al. transfer-learning setup)
+    for name, param in model.named_parameters():
+        if "classifier" not in name and "pre_classifier" not in name:
+            param.requires_grad = False
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+    return model.to(device)
+
+
+def run_fold(
+    fold_idx: int,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    tokenizer,
+    args,
+    device: str,
+) -> dict:
+    """Train and evaluate one fold. Returns per-label and overall metrics."""
+
+    train_ds = Dataset.from_pandas(train_df.reset_index(drop=True))
+    val_ds   = Dataset.from_pandas(val_df.reset_index(drop=True))
+
     train_ds = train_ds.map(lambda x: tokenize_function(x, tokenizer), batched=True)
-    val_ds = val_ds.map(lambda x: tokenize_function(x, tokenizer), batched=True)
-    train_ds.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-    val_ds.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+    val_ds   = val_ds.map(lambda x: tokenize_function(x, tokenizer),   batched=True)
+
+    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    val_ds.set_format(  type="torch", columns=["input_ids", "attention_mask", "label"])
+
+    fold_out = os.path.join(args.out_dir, f"fold_{fold_idx}")
+    os.makedirs(fold_out, exist_ok=True)
 
     training_args = TrainingArguments(
-        output_dir=args.out_dir,
+        output_dir=fold_out,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         evaluation_strategy="epoch",
         save_strategy="epoch",
-        logging_dir=os.path.join(args.out_dir, 'logs'),
+        logging_dir=os.path.join(fold_out, "logs"),
         logging_steps=50,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        report_to="none",
     )
+
+    model = build_model(args.model, device)
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
+        compute_metrics=compute_metrics,
     )
+
     trainer.train()
-    model.save_pretrained(args.out_dir)
-    tokenizer.save_pretrained(args.out_dir)
-    print(f"Model and tokenizer saved to {args.out_dir}")
+
+    # Evaluate on the validation fold
+    results = trainer.evaluate()
+    print(f"\n--- Fold {fold_idx} results ---")
+    for k, v in results.items():
+        print(f"  {k}: {v:.4f}")
+
+    # Save the best model of the last fold for downstream SHAP / attack work
+    if args.save_last_fold and fold_idx == args.n_repeats * args.n_splits:
+        model.save_pretrained(os.path.join(args.out_dir, "best_model"))
+        tokenizer.save_pretrained(os.path.join(args.out_dir, "best_model"))
+        print(f"\nFinal model saved to {os.path.join(args.out_dir, 'best_model')}")
+
+    return results
+
+
+def main(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}\n")
+
+    df = load_data(args.train_csv)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    # -----------------------------------------------------------------------
+    # 5x2-fold repeated cross-validation — exactly as in Kozik et al.
+    # n_splits=2, n_repeats=5 → 10 folds total
+    # -----------------------------------------------------------------------
+    rkf = RepeatedKFold(n_splits=args.n_splits, n_repeats=args.n_repeats, random_state=42)
+
+    all_metrics: list[dict] = []
+    fold_idx = 0
+
+    for train_idx, val_idx in rkf.split(df):
+        fold_idx += 1
+        print(f"\n{'='*60}")
+        print(f"  Fold {fold_idx} / {args.n_splits * args.n_repeats}")
+        print(f"{'='*60}")
+
+        train_df = df.iloc[train_idx]
+        val_df   = df.iloc[val_idx]
+
+        results = run_fold(fold_idx, train_df, val_df, tokenizer, args, device)
+        all_metrics.append(results)
+
+    # -----------------------------------------------------------------------
+    # Aggregate results across all folds (mean ± std), matching Table 1 style
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("  FINAL RESULTS (mean ± std across all folds)")
+    print(f"{'='*60}")
+
+    metric_keys = [k for k in all_metrics[0].keys() if k.startswith("eval_")]
+    summary = {}
+    for key in metric_keys:
+        values = [m[key] for m in all_metrics]
+        mean, std = np.mean(values), np.std(values)
+        summary[key] = (mean, std)
+        print(f"  {key.replace('eval_', ''):<30} {mean:.3f} ± {std:.3f}")
+
+    # Save summary CSV
+    summary_path = os.path.join(args.out_dir, "cv_results.csv")
+    os.makedirs(args.out_dir, exist_ok=True)
+    rows = [{"metric": k.replace("eval_", ""), "mean": v[0], "std": v[1]}
+            for k, v in summary.items()]
+    pd.DataFrame(rows).to_csv(summary_path, index=False)
+    print(f"\nSummary saved to {summary_path}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train_csv', required=True, help='Path to processed LIAR CSV')
-    parser.add_argument('--out_dir', required=True, help='Output directory for model')
-    parser.add_argument('--model', default='distilbert-base-uncased', help='HuggingFace model name')
-    parser.add_argument('--epochs', type=int, default=3)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser = argparse.ArgumentParser(
+        description="Train DistilBERT fake-news classifier on LIAR (binary), "
+                    "replicating Kozik et al. (2023) methodology."
+    )
+    parser.add_argument(
+        "--train_csv",
+        default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_binary.csv",
+        help="Path to preprocessed binary LIAR CSV",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default="/cluster/home/williasf/xai-adversarial-attacks/models/liar_model",
+        help="Output directory for model checkpoints and results",
+    )
+    parser.add_argument(
+        "--model",
+        default="distilbert-base-uncased",
+        help="HuggingFace model name (default: distilbert-base-uncased)",
+    )
+    parser.add_argument("--epochs",     type=int,   default=3)
+    parser.add_argument("--batch_size", type=int,   default=16)
+    parser.add_argument("--n_splits",   type=int,   default=2,
+                        help="Folds per repeat (default: 2, as in 5x2-CV)")
+    parser.add_argument("--n_repeats",  type=int,   default=5,
+                        help="Number of repeats (default: 5, as in 5x2-CV)")
+    parser.add_argument("--save_last_fold", action="store_true",
+                        help="Save the model from the final fold for SHAP/attack use")
+
     args = parser.parse_args()
     main(args)
