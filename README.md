@@ -30,12 +30,17 @@ python scripts/preprocess_liar.py --input data/LIAR/data/raw/train.tsv --out_dir
 
 ### 2. Train Model
 ```bash
-python scripts/train.py --train_csv data/processed/liar_binary.csv --out_dir models/BERT/fine_tuned/
+python scripts/preprocess_liar.py \
+  --input data/raw/train.tsv \
+  --out_dir data/processed/
 ```
 
 ### 3. Test Model
 ```bash
-python scripts/test.py --test_csv data/processed/liar_binary.csv --model_dir models/BERT/fine_tuned/
+python test.py \
+  --test_csv /cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_binary.csv \
+  --model_dir /cluster/home/williasf/xai-adversarial-attacks/models/liar_model \
+  --batch_size 32
 ```
 
 ### 4. SHAP Explainability

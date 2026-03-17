@@ -5,9 +5,10 @@ import torch
 import pandas as pd
 from sklearn.model_selection import RepeatedKFold
 from sklearn.metrics import (
-    precision_score, recall_score, f1_score,
-    accuracy_score, balanced_accuracy_score
+    accuracy_score, balanced_accuracy_score,
+    classification_report,
 )
+from sklearn.metrics import confusion_matrix
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
@@ -54,18 +55,38 @@ def tokenize_function(examples, tokenizer):
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
+    report = classification_report(
+        labels,
+        preds,
+        labels=[0, 1],
+        target_names=["FAKE", "TRUE"],
+        output_dict=True,
+        zero_division=0,
+    )
+
+    # G-mean for binary: sqrt(sensitivity * specificity)
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        gmean = np.sqrt(sensitivity * specificity)
+    else:
+        gmean = 0.0
+
     return {
         "accuracy":          accuracy_score(labels, preds),
         "balanced_accuracy": balanced_accuracy_score(labels, preds),
-        "precision_macro":   precision_score(labels, preds, average="macro", zero_division=0),
-        "recall_macro":      recall_score(labels, preds, average="macro", zero_division=0),
-        "f1_macro":          f1_score(labels, preds, average="macro", zero_division=0),
-        "precision_fake":    precision_score(labels, preds, pos_label=0, zero_division=0),
-        "recall_fake":       recall_score(labels, preds, pos_label=0, zero_division=0),
-        "f1_fake":           f1_score(labels, preds, pos_label=0, zero_division=0),
-        "precision_real":    precision_score(labels, preds, pos_label=1, zero_division=0),
-        "recall_real":       recall_score(labels, preds, pos_label=1, zero_division=0),
-        "f1_real":           f1_score(labels, preds, pos_label=1, zero_division=0),
+        "precision":         report["macro avg"]["precision"],
+        "recall":            report["macro avg"]["recall"],
+        "f1":                report["macro avg"]["f1-score"],
+        "precision_fake":    report["FAKE"]["precision"],
+        "recall_fake":       report["FAKE"]["recall"],
+        "f1_fake":           report["FAKE"]["f1-score"],
+        "precision_true":    report["TRUE"]["precision"],
+        "recall_true":       report["TRUE"]["recall"],
+        "f1_true":           report["TRUE"]["f1-score"],
+        "gmean":             gmean,
     }
 
 
@@ -102,9 +123,8 @@ def run_fold(
     tokenizer,
     args,
     device: str,
-) -> dict:
-    """Train and evaluate one fold. Returns per-label and overall metrics."""
-
+) -> tuple:
+    """Train and evaluate one fold. Returns metrics and model/trainer."""
     train_ds = Dataset.from_pandas(train_df.reset_index(drop=True))
     val_ds   = Dataset.from_pandas(val_df.reset_index(drop=True))
 
@@ -127,7 +147,7 @@ def run_fold(
         logging_dir=os.path.join(fold_out, "logs"),
         logging_steps=50,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        metric_for_best_model="eval_f1",
         report_to="none",
     )
 
@@ -142,20 +162,20 @@ def run_fold(
     )
 
     trainer.train()
-
-    # Evaluate on the validation fold
     results = trainer.evaluate()
     print(f"\n--- Fold {fold_idx} results ---")
-    for k, v in results.items():
+    fold_metric_keys = [
+        "eval_precision", "eval_precision_fake", "eval_precision_true",
+        "eval_recall", "eval_recall_fake", "eval_recall_true",
+        "eval_f1", "eval_f1_fake", "eval_f1_true",
+        "eval_accuracy", "eval_balanced_accuracy", "eval_gmean",
+    ]
+    for k in fold_metric_keys:
+        v = results.get(k)
+        if v is None:
+            continue
         print(f"  {k}: {v:.4f}")
-
-    # Save the best model of the last fold for downstream SHAP / attack work
-    if args.save_last_fold and fold_idx == args.n_repeats * args.n_splits:
-        model.save_pretrained(os.path.join(args.out_dir, "best_model"))
-        tokenizer.save_pretrained(os.path.join(args.out_dir, "best_model"))
-        print(f"\nFinal model saved to {os.path.join(args.out_dir, 'best_model')}")
-
-    return results
+    return results, model, tokenizer
 
 
 def main(args):
@@ -165,49 +185,89 @@ def main(args):
     df = load_data(args.train_csv)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # -----------------------------------------------------------------------
-    # 5x2-fold repeated cross-validation — exactly as in Kozik et al.
-    # n_splits=2, n_repeats=5 → 10 folds total
-    # -----------------------------------------------------------------------
-    rkf = RepeatedKFold(n_splits=args.n_splits, n_repeats=args.n_repeats, random_state=42)
+    # 5x2-fold repeated cross-validation (n_splits=2, n_repeats=5)
+    rkf = RepeatedKFold(n_splits=2, n_repeats=5, random_state=42)
 
     all_metrics: list[dict] = []
+    best_f1 = -1
+    best_model = None
+    best_tokenizer = None
     fold_idx = 0
 
     for train_idx, val_idx in rkf.split(df):
         fold_idx += 1
         print(f"\n{'='*60}")
-        print(f"  Fold {fold_idx} / {args.n_splits * args.n_repeats}")
+        print(f"  Fold {fold_idx} / 10")
         print(f"{'='*60}")
 
         train_df = df.iloc[train_idx]
         val_df   = df.iloc[val_idx]
 
-        results = run_fold(fold_idx, train_df, val_df, tokenizer, args, device)
+        results, model, tok = run_fold(fold_idx, train_df, val_df, tokenizer, args, device)
         all_metrics.append(results)
+        # Use F1 to select best model
+        f1 = results.get("eval_f1", results.get("f1", 0.0))
+        if f1 > best_f1:
+            best_f1 = f1
+            best_model = model
+            best_tokenizer = tok
 
-    # -----------------------------------------------------------------------
-    # Aggregate results across all folds (mean ± std), matching Table 1 style
-    # -----------------------------------------------------------------------
+    # Aggregate results across all folds (mean ± std)
     print(f"\n{'='*60}")
     print("  FINAL RESULTS (mean ± std across all folds)")
     print(f"{'='*60}")
-
-    metric_keys = [k for k in all_metrics[0].keys() if k.startswith("eval_")]
+    metric_layout = [
+        ("Precision", "eval_precision", "eval_precision_fake", "eval_precision_true"),
+        ("Recall", "eval_recall", "eval_recall_fake", "eval_recall_true"),
+        ("F1", "eval_f1", "eval_f1_fake", "eval_f1_true"),
+        ("Accuracy", "eval_accuracy", None, None),
+        ("Balanced Accuracy", "eval_balanced_accuracy", None, None),
+        ("G-mean", "eval_gmean", None, None),
+    ]
     summary = {}
-    for key in metric_keys:
-        values = [m[key] for m in all_metrics]
-        mean, std = np.mean(values), np.std(values)
-        summary[key] = (mean, std)
-        print(f"  {key.replace('eval_', ''):<30} {mean:.3f} ± {std:.3f}")
+    for _, avg_key, fake_key, true_key in metric_layout:
+        keys = [k for k in [avg_key, fake_key, true_key] if k is not None]
+        for key in keys:
+            values = [m.get(key, 0.0) for m in all_metrics]
+            summary[key] = (np.mean(values), np.std(values))
+
+    def fmt_metric(mean_std):
+        return f"{mean_std[0]:.3f} ± {mean_std[1]:.3f}"
+
+    print("  Metric              Average            Label:FAKE         Label:TRUE")
+    for metric_name, avg_key, fake_key, true_key in metric_layout:
+        avg_str = fmt_metric(summary[avg_key])
+        fake_str = fmt_metric(summary[fake_key]) if fake_key else "-"
+        true_str = fmt_metric(summary[true_key]) if true_key else "-"
+        print(f"  {metric_name:<19} {avg_str:<18} {fake_str:<18} {true_str}")
 
     # Save summary CSV
     summary_path = os.path.join(args.out_dir, "cv_results.csv")
     os.makedirs(args.out_dir, exist_ok=True)
-    rows = [{"metric": k.replace("eval_", ""), "mean": v[0], "std": v[1]}
-            for k, v in summary.items()]
+    rows = []
+    for metric_name, avg_key, fake_key, true_key in metric_layout:
+        avg_mean, avg_std = summary[avg_key]
+        fake_mean, fake_std = summary[fake_key] if fake_key else (np.nan, np.nan)
+        true_mean, true_std = summary[true_key] if true_key else (np.nan, np.nan)
+        rows.append(
+            {
+                "metric": metric_name,
+                "average_mean": avg_mean,
+                "average_std": avg_std,
+                "fake_mean": fake_mean,
+                "fake_std": fake_std,
+                "true_mean": true_mean,
+                "true_std": true_std,
+            }
+        )
     pd.DataFrame(rows).to_csv(summary_path, index=False)
     print(f"\nSummary saved to {summary_path}")
+
+    # Save best model by validation F1
+    if best_model is not None:
+        best_model.save_pretrained(os.path.join(args.out_dir, "best_model"))
+        best_tokenizer.save_pretrained(os.path.join(args.out_dir, "best_model"))
+        print(f"\nBest model (by validation F1) saved to {os.path.join(args.out_dir, 'best_model')}")
 
 
 if __name__ == "__main__":
@@ -230,14 +290,9 @@ if __name__ == "__main__":
         default="distilbert-base-uncased",
         help="HuggingFace model name (default: distilbert-base-uncased)",
     )
-    parser.add_argument("--epochs",     type=int,   default=3)
-    parser.add_argument("--batch_size", type=int,   default=16)
-    parser.add_argument("--n_splits",   type=int,   default=2,
-                        help="Folds per repeat (default: 2, as in 5x2-CV)")
-    parser.add_argument("--n_repeats",  type=int,   default=5,
-                        help="Number of repeats (default: 5, as in 5x2-CV)")
-    parser.add_argument("--save_last_fold", action="store_true",
-                        help="Save the model from the final fold for SHAP/attack use")
-
+    parser.add_argument("--epochs",     type=int,   default=3,
+                        help="Number of training epochs (default: 3)")
+    parser.add_argument("--batch_size", type=int,   default=16,
+                        help="Batch size (default: 16)")
     args = parser.parse_args()
     main(args)
