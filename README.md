@@ -44,12 +44,22 @@ python test.py \
 ```
 
 ### 4. SHAP Explainability
+#### 4.1 Automatic
 ```bash
 python scripts/xai_attack_shap.py \
   --test_csv data/processed/liar_binary.csv \
   --model_dir models/liar_model/best_model \
   --n_samples 10 \
   --out_path results/shap_attack_results.csv
+```
+
+#### 4.2 Manual
+```bash
+python scripts/inspect_tokens.py \
+  --model_dir models/liar_model/best_model \
+  --test_csv data/processed/liar_binary.csv \
+  --sample_idx 0 \
+  --html_out results/shap_inspection.html
 ```
 
 ## Notes

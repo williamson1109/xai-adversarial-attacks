@@ -1,6 +1,11 @@
 import argparse
+import getpass
+import http.server
 import os
 import re
+import socket
+import socketserver
+import threading
 from dataclasses import dataclass
 from typing import List, Sequence
 
@@ -48,7 +53,7 @@ class TokenInspector:
 
         def predict_fn(texts):
             probs = self.get_probs(texts)
-            return sp.special.logit(probs[:, 1])
+            return sp.special.logit(probs[:, 0])
 
         self.predict_fn = predict_fn
         self.explainer = shap.Explainer(self.predict_fn, self.tokenizer)
@@ -104,7 +109,7 @@ class TokenInspector:
             if not cleaned:
                 continue
             numeric_value = float(value)
-            direction = "-> pushes toward TRUE" if numeric_value >= 0 else "-> pushes toward FAKE"
+            direction = "-> pushes toward FAKE" if numeric_value >= 0 else "-> pushes toward TRUE"
             rows.append(
                 {
                     "token": cleaned,
@@ -143,12 +148,50 @@ def print_token_table(rows: List[dict], limit: int = 20):
 
 def save_shap_html(shap_values, html_out: str):
     os.makedirs(os.path.dirname(html_out) or ".", exist_ok=True)
-    html = shap.plots.text(shap_values, display=False)
-    if not isinstance(html, str):
-        html = str(html)
+    try:
+        html_fragment = shap.plots.text(shap_values, display=False)
+    except ImportError as exc:
+        raise ImportError(
+            "Saving the SHAP HTML visualization requires matplotlib. "
+            "Install it with `pip install matplotlib` or `pip install -r requirements.txt`."
+        ) from exc
+    if not isinstance(html_fragment, str):
+        html_fragment = str(html_fragment)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SHAP Token Inspection</title>
+  {shap.getjs()}
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      margin: 24px;
+      background: #ffffff;
+      color: #111111;
+    }}
+    .container {{
+      max-width: 1200px;
+      margin: 0 auto;
+    }}
+    h1 {{
+      font-size: 24px;
+      margin-bottom: 16px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>SHAP Text Explanation</h1>
+    {html_fragment}
+  </div>
+</body>
+</html>
+"""
     with open(html_out, "w", encoding="utf-8") as handle:
         handle.write(html)
-    print(f"Saved SHAP HTML to {html_out}")
+    print(f"Saved SHAP HTML to {os.path.abspath(html_out)}")
 
 
 def replace_first_token(text: str, old: str, new: str) -> str:
@@ -157,6 +200,37 @@ def replace_first_token(text: str, old: str, new: str) -> str:
     if count == 0:
         updated = text.replace(old, new, 1)
     return normalize_text(updated)
+
+
+def start_html_server(html_out: str, host: str, port: int):
+    serve_dir = os.path.abspath(os.path.dirname(html_out) or ".")
+    handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(  # noqa: E731
+        *args,
+        directory=serve_dir,
+        **kwargs,
+    )
+    server = socketserver.ThreadingTCPServer((host, port), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def print_browser_instructions(html_out: str, host: str, port: int):
+    file_name = os.path.basename(html_out)
+    remote_url = f"http://{host}:{port}/{file_name}"
+    local_url = f"http://localhost:{port}/{file_name}"
+    hostname = socket.gethostname()
+    user = getpass.getuser()
+
+    print("\nSHAP viewer")
+    print("=" * 72)
+    print(f"Remote server: {remote_url}")
+    print(f"Local browser URL after tunnel: {local_url}")
+    print("From your laptop, run:")
+    print(f"ssh -N -L {port}:127.0.0.1:{port} {user}@{hostname}")
+    print(f"Then open: {local_url}")
+    print("Refresh the page after each token replacement to see the updated SHAP view.")
 
 
 def inspect_once(inspector: TokenInspector, text: str, html_out: str, prefix: str):
@@ -237,12 +311,18 @@ def print_summary(history: List[dict], initial_prediction: PredictionResult, fin
 def main(args: argparse.Namespace):
     text = load_text(args)
     inspector = TokenInspector(args.model_dir, args.batch_size)
+    server, _ = start_html_server(args.html_out, args.serve_host, args.serve_port)
 
     print(f"Using device: {inspector.device}")
-    initial_prediction, _, _ = inspect_once(inspector, text, args.html_out, prefix="Original")
-    final_text, history = interactive_flip_loop(inspector, text, args.html_out)
-    final_prediction = inspector.predict_text(final_text)
-    print_summary(history, initial_prediction, final_prediction)
+    print_browser_instructions(args.html_out, args.serve_host, args.serve_port)
+    try:
+        initial_prediction, _, _ = inspect_once(inspector, text, args.html_out, prefix="Original")
+        final_text, history = interactive_flip_loop(inspector, text, args.html_out)
+        final_prediction = inspector.predict_text(final_text)
+        print_summary(history, initial_prediction, final_prediction)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
@@ -259,4 +339,6 @@ if __name__ == "__main__":
         help="Path to save the SHAP HTML visualization",
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
+    parser.add_argument("--serve_host", default="127.0.0.1", help="Host for the local HTML server")
+    parser.add_argument("--serve_port", type=int, default=8765, help="Port for the local HTML server")
     main(parser.parse_args())

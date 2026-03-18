@@ -11,3 +11,4 @@ nltk
 sentencepiece
 nlpaug
 python-Levenshtein
+matplotlib
