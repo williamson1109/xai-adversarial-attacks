@@ -1,0 +1,262 @@
+import argparse
+import os
+import re
+from dataclasses import dataclass
+from typing import List, Sequence
+
+import numpy as np
+import pandas as pd
+import scipy as sp
+import shap
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+
+MAX_TOKENS = 250
+LABEL_NAMES = {0: "FAKE", 1: "TRUE"}
+SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>"}
+
+
+@dataclass
+class PredictionResult:
+    label: int
+    confidence: float
+    probabilities: np.ndarray
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def clean_token(token: str) -> str:
+    text = str(token)
+    for marker in ("##", "Ġ", "▁"):
+        text = text.replace(marker, " ")
+    text = text.strip()
+    if not text or text in SPECIAL_TOKENS:
+        return ""
+    return text
+
+
+class TokenInspector:
+    def __init__(self, model_dir: str, batch_size: int):
+        self.batch_size = batch_size
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(self.device)
+        self.model.eval()
+
+        def predict_fn(texts):
+            probs = self.get_probs(texts)
+            return sp.special.logit(probs[:, 1])
+
+        self.predict_fn = predict_fn
+        self.explainer = shap.Explainer(self.predict_fn, self.tokenizer)
+
+    def get_probs(self, texts: Sequence[str]) -> np.ndarray:
+        if isinstance(texts, np.ndarray):
+            texts = texts.tolist()
+        texts = [str(text) for text in texts]
+        all_probs = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            encoded = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=MAX_TOKENS,
+            )
+            encoded = {key: value.to(self.device) for key, value in encoded.items()}
+            with torch.no_grad():
+                logits = self.model(**encoded).logits
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            all_probs.append(probs)
+        return np.vstack(all_probs)
+
+    def predict_text(self, text: str) -> PredictionResult:
+        probs = self.get_probs([text])[0]
+        label = int(np.argmax(probs))
+        return PredictionResult(
+            label=label,
+            confidence=float(probs[label]),
+            probabilities=probs,
+        )
+
+    def explain_text(self, text: str):
+        return self.explainer([text], fixed_context=1)
+
+    def extract_ranked_tokens(self, shap_values) -> List[dict]:
+        raw_tokens = shap_values.data[0]
+        raw_values = shap_values.values[0]
+
+        if hasattr(raw_tokens, "tolist"):
+            raw_tokens = raw_tokens.tolist()
+        else:
+            raw_tokens = list(raw_tokens)
+
+        if hasattr(raw_values, "tolist"):
+            raw_values = raw_values.tolist()
+
+        rows = []
+        for token, value in zip(raw_tokens, raw_values):
+            cleaned = clean_token(token)
+            if not cleaned:
+                continue
+            numeric_value = float(value)
+            direction = "-> pushes toward TRUE" if numeric_value >= 0 else "-> pushes toward FAKE"
+            rows.append(
+                {
+                    "token": cleaned,
+                    "value": numeric_value,
+                    "abs_value": abs(numeric_value),
+                    "direction": direction,
+                }
+            )
+
+        rows.sort(key=lambda row: row["abs_value"], reverse=True)
+        return rows
+
+
+def load_text(args: argparse.Namespace) -> str:
+    if args.text:
+        return normalize_text(args.text)
+
+    df = pd.read_csv(args.test_csv, usecols=["statement", "label"])
+    if args.sample_idx < 0 or args.sample_idx >= len(df):
+        raise IndexError(f"--sample_idx {args.sample_idx} is out of range for {len(df)} rows.")
+    return normalize_text(df.iloc[args.sample_idx]["statement"])
+
+
+def print_prediction(prediction: PredictionResult, prefix: str):
+    print(f"{prefix} prediction: {LABEL_NAMES[prediction.label]} ({prediction.confidence:.4f})")
+    print(f"{prefix} probabilities: FAKE={prediction.probabilities[0]:.4f}, TRUE={prediction.probabilities[1]:.4f}")
+
+
+def print_token_table(rows: List[dict], limit: int = 20):
+    print("\nRank  Token                      SHAP Value   Direction")
+    print("-" * 72)
+    for rank, row in enumerate(rows[:limit], start=1):
+        token = f'"{row["token"]}"'
+        print(f"{rank:<5} {token:<26} {row['value']:+.3f}      {row['direction']}")
+
+
+def save_shap_html(shap_values, html_out: str):
+    os.makedirs(os.path.dirname(html_out) or ".", exist_ok=True)
+    html = shap.plots.text(shap_values, display=False)
+    if not isinstance(html, str):
+        html = str(html)
+    with open(html_out, "w", encoding="utf-8") as handle:
+        handle.write(html)
+    print(f"Saved SHAP HTML to {html_out}")
+
+
+def replace_first_token(text: str, old: str, new: str) -> str:
+    pattern = re.compile(rf"\b{re.escape(old)}\b", flags=re.IGNORECASE)
+    updated, count = pattern.subn(new, text, count=1)
+    if count == 0:
+        updated = text.replace(old, new, 1)
+    return normalize_text(updated)
+
+
+def inspect_once(inspector: TokenInspector, text: str, html_out: str, prefix: str):
+    prediction = inspector.predict_text(text)
+    print(f"\nText:\n{text}\n")
+    print_prediction(prediction, prefix=prefix)
+    shap_values = inspector.explain_text(text)
+    ranked_tokens = inspector.extract_ranked_tokens(shap_values)
+    print_token_table(ranked_tokens)
+    save_shap_html(shap_values, html_out)
+    return prediction, shap_values, ranked_tokens
+
+
+def interactive_flip_loop(inspector: TokenInspector, original_text: str, html_out: str):
+    current_text = original_text
+    history = []
+
+    while True:
+        token_to_replace = input("\nEnter a token to replace (or press Enter to skip): ").strip()
+        if token_to_replace.lower() == "quit":
+            break
+        if token_to_replace == "":
+            break
+
+        replacement = input("Replace with: ").strip()
+        if replacement.lower() == "quit":
+            break
+
+        previous_prediction = inspector.predict_text(current_text)
+        updated_text = replace_first_token(current_text, token_to_replace, replacement)
+        if updated_text == current_text:
+            print("No change made; token not found.")
+            continue
+
+        current_text = updated_text
+        new_prediction, _, _ = inspect_once(inspector, current_text, html_out, prefix="Modified")
+        history.append(
+            {
+                "replace": token_to_replace,
+                "with": replacement,
+                "before_label": previous_prediction.label,
+                "before_conf": previous_prediction.confidence,
+                "after_label": new_prediction.label,
+                "after_conf": new_prediction.confidence,
+                "text": current_text,
+            }
+        )
+
+        keep_going = input("Flip another token? [y/N or quit]: ").strip().lower()
+        if keep_going in {"quit", "n", "no", ""}:
+            break
+
+    return current_text, history
+
+
+def print_summary(history: List[dict], initial_prediction: PredictionResult, final_prediction: PredictionResult):
+    print("\nSummary")
+    print("=" * 72)
+    print(
+        f"Initial prediction: {LABEL_NAMES[initial_prediction.label]} ({initial_prediction.confidence:.4f})"
+    )
+    print(
+        f"Final prediction:   {LABEL_NAMES[final_prediction.label]} ({final_prediction.confidence:.4f})"
+    )
+    if not history:
+        print("No replacements were made.")
+        return
+
+    for step, item in enumerate(history, start=1):
+        before_label = LABEL_NAMES[item["before_label"]]
+        after_label = LABEL_NAMES[item["after_label"]]
+        print(
+            f"{step}. \"{item['replace']}\" -> \"{item['with']}\" | "
+            f"{before_label} ({item['before_conf']:.4f}) -> {after_label} ({item['after_conf']:.4f})"
+        )
+
+
+def main(args: argparse.Namespace):
+    text = load_text(args)
+    inspector = TokenInspector(args.model_dir, args.batch_size)
+
+    print(f"Using device: {inspector.device}")
+    initial_prediction, _, _ = inspect_once(inspector, text, args.html_out, prefix="Original")
+    final_text, history = interactive_flip_loop(inspector, text, args.html_out)
+    final_prediction = inspector.predict_text(final_text)
+    print_summary(history, initial_prediction, final_prediction)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Interactively inspect SHAP token importance and test manual token flips."
+    )
+    parser.add_argument("--model_dir", required=True, help="Directory containing the trained model and tokenizer")
+    parser.add_argument("--test_csv", required=True, help="CSV with statement and label columns")
+    parser.add_argument("--sample_idx", type=int, default=0, help="Row index in the CSV to inspect")
+    parser.add_argument("--text", default=None, help="Optional raw text to inspect instead of a CSV sample")
+    parser.add_argument(
+        "--html_out",
+        default="shap_inspection.html",
+        help="Path to save the SHAP HTML visualization",
+    )
+    parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
+    main(parser.parse_args())
