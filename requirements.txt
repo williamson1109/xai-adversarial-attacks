@@ -9,3 +9,5 @@ shap
 tqdm
 nltk
 sentencepiece
+nlpaug
+python-Levenshtein

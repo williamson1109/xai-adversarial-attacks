@@ -45,7 +45,11 @@ python test.py \
 
 ### 4. SHAP Explainability
 ```bash
-python scripts/xai_attack_shap.py --test_csv data/processed/liar_binary.csv --model_dir models/BERT/fine_tuned/ --n_samples 5
+python scripts/xai_attack_shap.py \
+  --test_csv data/processed/liar_binary.csv \
+  --model_dir models/liar_model/best_model \
+  --n_samples 10 \
+  --out_path results/shap_attack_results.csv
 ```
 
 ## Notes
