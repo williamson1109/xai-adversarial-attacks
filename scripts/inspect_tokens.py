@@ -209,7 +209,11 @@ def start_html_server(html_out: str, host: str, port: int):
         directory=serve_dir,
         **kwargs,
     )
-    server = socketserver.ThreadingTCPServer((host, port), handler)
+
+    class ReusableTCPServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+
+    server = ReusableTCPServer((host, port), handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
