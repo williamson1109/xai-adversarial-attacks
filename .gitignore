@@ -31,3 +31,6 @@ data/LIAR/data/processed/val_binary.csv
 data/LIAR/data/processed/liar_original.csv
 data/LIAR/data/processed/train_binary.csv
 data/processed/liar_binary.csv
+
+# Model checkpoints
+models/
