@@ -7,7 +7,7 @@ import socket
 import socketserver
 import threading
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,12 @@ def clean_token(token: str) -> str:
     if not text or text in SPECIAL_TOKENS:
         return ""
     return text
+
+
+@dataclass
+class LoadedSample:
+    text: str
+    true_label: Optional[int]
 
 
 class TokenInspector:
@@ -123,19 +129,65 @@ class TokenInspector:
         return rows
 
 
-def load_text(args: argparse.Namespace) -> str:
+def load_text(args: argparse.Namespace) -> LoadedSample:
     if args.text:
-        return normalize_text(args.text)
+        return LoadedSample(text=normalize_text(args.text), true_label=None)
 
     df = pd.read_csv(args.test_csv, usecols=["statement", "label"])
     if args.sample_idx < 0 or args.sample_idx >= len(df):
         raise IndexError(f"--sample_idx {args.sample_idx} is out of range for {len(df)} rows.")
-    return normalize_text(df.iloc[args.sample_idx]["statement"])
+    row = df.iloc[args.sample_idx]
+    return LoadedSample(text=normalize_text(row["statement"]), true_label=int(row["label"]))
 
 
 def print_prediction(prediction: PredictionResult, prefix: str):
     print(f"{prefix} prediction: {LABEL_NAMES[prediction.label]} ({prediction.confidence:.4f})")
     print(f"{prefix} probabilities: FAKE={prediction.probabilities[0]:.4f}, TRUE={prediction.probabilities[1]:.4f}")
+
+
+def compute_text_statistics(
+    tokenizer,
+    text: str,
+) -> Tuple[int, int, int]:
+    whitespace_tokens = text.split()
+    word_count = sum(1 for token in whitespace_tokens if re.search(r"\w", token))
+
+    wordpiece_tokens = tokenizer.tokenize(text)
+    wordpiece_count = len(wordpiece_tokens) + 2  # [CLS] and [SEP]
+
+    subword_splits = 0
+    for token in whitespace_tokens:
+        if not re.search(r"\w", token):
+            continue
+        pieces = tokenizer.tokenize(token)
+        if any("##" in piece for piece in pieces):
+            subword_splits += 1
+
+    return word_count, wordpiece_count, subword_splits
+
+
+def print_text_statistics(
+    tokenizer,
+    text: str,
+    prediction: PredictionResult,
+    true_label: Optional[int],
+):
+    word_count, wordpiece_count, subword_splits = compute_text_statistics(
+        tokenizer=tokenizer,
+        text=text,
+    )
+    true_label_text = LABEL_NAMES[true_label] if true_label is not None else "N/A"
+
+    print("═" * 51)
+    print("TEXT STATISTICS")
+    print("═" * 51)
+    print(f'  Original text     : "{text}"')
+    print(f"  Word count        : {word_count}")
+    print(f"  WordPiece tokens  : {wordpiece_count}  (incl. [CLS] and [SEP])")
+    print(f"  Subword splits    : {subword_splits}   (words split into multiple tokens)")
+    print(f"  Prediction        : {LABEL_NAMES[prediction.label]} ({prediction.confidence:.4f})")
+    print(f"  True label        : {true_label_text}")
+    print("═" * 51)
 
 
 def print_token_table(rows: List[dict], limit: int = 20):
@@ -237,18 +289,35 @@ def print_browser_instructions(html_out: str, host: str, port: int):
     print("Refresh the page after each token replacement to see the updated SHAP view.")
 
 
-def inspect_once(inspector: TokenInspector, text: str, html_out: str, prefix: str):
+def inspect_once(
+    inspector: TokenInspector,
+    text: str,
+    html_out: str,
+    prefix: str,
+    true_label: Optional[int],
+):
     prediction = inspector.predict_text(text)
     print(f"\nText:\n{text}\n")
     print_prediction(prediction, prefix=prefix)
     shap_values = inspector.explain_text(text)
     ranked_tokens = inspector.extract_ranked_tokens(shap_values)
+    print_text_statistics(
+        tokenizer=inspector.tokenizer,
+        text=text,
+        prediction=prediction,
+        true_label=true_label,
+    )
     print_token_table(ranked_tokens)
     save_shap_html(shap_values, html_out)
     return prediction, shap_values, ranked_tokens
 
 
-def interactive_flip_loop(inspector: TokenInspector, original_text: str, html_out: str):
+def interactive_flip_loop(
+    inspector: TokenInspector,
+    original_text: str,
+    html_out: str,
+    true_label: Optional[int],
+):
     current_text = original_text
     history = []
 
@@ -270,7 +339,13 @@ def interactive_flip_loop(inspector: TokenInspector, original_text: str, html_ou
             continue
 
         current_text = updated_text
-        new_prediction, _, _ = inspect_once(inspector, current_text, html_out, prefix="Modified")
+        new_prediction, _, _ = inspect_once(
+            inspector,
+            current_text,
+            html_out,
+            prefix="Modified",
+            true_label=true_label,
+        )
         history.append(
             {
                 "replace": token_to_replace,
@@ -313,15 +388,27 @@ def print_summary(history: List[dict], initial_prediction: PredictionResult, fin
 
 
 def main(args: argparse.Namespace):
-    text = load_text(args)
+    sample = load_text(args)
+    text = sample.text
     inspector = TokenInspector(args.model_dir, args.batch_size)
     server, _ = start_html_server(args.html_out, args.serve_host, args.serve_port)
 
     print(f"Using device: {inspector.device}")
     print_browser_instructions(args.html_out, args.serve_host, args.serve_port)
     try:
-        initial_prediction, _, _ = inspect_once(inspector, text, args.html_out, prefix="Original")
-        final_text, history = interactive_flip_loop(inspector, text, args.html_out)
+        initial_prediction, _, _ = inspect_once(
+            inspector,
+            text,
+            args.html_out,
+            prefix="Original",
+            true_label=sample.true_label,
+        )
+        final_text, history = interactive_flip_loop(
+            inspector,
+            text,
+            args.html_out,
+            true_label=sample.true_label,
+        )
         final_prediction = inspector.predict_text(final_text)
         print_summary(history, initial_prediction, final_prediction)
     finally:
