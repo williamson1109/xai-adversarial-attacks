@@ -109,14 +109,29 @@ class TokenInspector:
         if hasattr(raw_values, "tolist"):
             raw_values = raw_values.tolist()
 
-        rows = []
+        merged_rows = []
         for token, value in zip(raw_tokens, raw_values):
-            cleaned = clean_token(token)
+            token_text = str(token).strip()
+            cleaned = clean_token(token_text)
             if not cleaned:
                 continue
+
             numeric_value = float(value)
+            is_wordpiece_continuation = token_text.startswith("##")
+
+            if is_wordpiece_continuation and merged_rows:
+                merged_rows[-1]["token"] += cleaned
+                merged_rows[-1]["value"] += numeric_value
+                merged_rows[-1]["abs_value"] = abs(merged_rows[-1]["value"])
+                merged_rows[-1]["direction"] = (
+                    "-> pushes toward FAKE"
+                    if merged_rows[-1]["value"] >= 0
+                    else "-> pushes toward TRUE"
+                )
+                continue
+
             direction = "-> pushes toward FAKE" if numeric_value >= 0 else "-> pushes toward TRUE"
-            rows.append(
+            merged_rows.append(
                 {
                     "token": cleaned,
                     "value": numeric_value,
@@ -125,8 +140,8 @@ class TokenInspector:
                 }
             )
 
-        rows.sort(key=lambda row: row["abs_value"], reverse=True)
-        return rows
+        merged_rows.sort(key=lambda row: row["abs_value"], reverse=True)
+        return merged_rows
 
 
 def load_text(args: argparse.Namespace) -> LoadedSample:
