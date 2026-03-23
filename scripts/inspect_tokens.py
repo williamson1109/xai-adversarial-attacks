@@ -19,18 +19,29 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 MAX_TOKENS = 250
 LABEL_NAMES = {0: "FAKE", 1: "TRUE"}
-SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>"}
+SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>", ""}
 
 
 @dataclass
 class PredictionResult:
     label: int
     confidence: float
+    logit: float
     probabilities: np.ndarray
 
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text))
+
+
+def collapse_spaces_around_punct(text: str) -> str:
+    text = re.sub(r"\s+([,.;:!?%)\]\}])", r"\1", text)
+    text = re.sub(r"([(\[\{])\s+", r"\1", text)
+    return text
 
 
 def clean_token(token: str) -> str:
@@ -41,6 +52,102 @@ def clean_token(token: str) -> str:
     if not text or text in SPECIAL_TOKENS:
         return ""
     return text
+
+
+def count_and_mask_boundary_special_tokens(shap_values) -> int:
+    raw_tokens = shap_values.data[0]
+    if hasattr(raw_tokens, "tolist"):
+        raw_tokens = raw_tokens.tolist()
+    else:
+        raw_tokens = list(raw_tokens)
+
+    masked_values = np.array(shap_values.values, copy=True)
+    token_values = masked_values[0] if masked_values.ndim > 1 else masked_values
+
+    masked_count = 0
+
+    if raw_tokens:
+        first_token = str(raw_tokens[0]).strip()
+        if first_token == "[CLS]":
+            token_values[0] = 0.0
+            masked_count += 1
+
+    sep_index = None
+    for idx in range(len(raw_tokens) - 1, -1, -1):
+        token = str(raw_tokens[idx]).strip()
+        if token in {"[PAD]", "<pad>", ""}:
+            continue
+        sep_index = idx
+        break
+
+    if sep_index is not None and sep_index != 0:
+        last_non_padding_token = str(raw_tokens[sep_index]).strip()
+        if last_non_padding_token == "[SEP]":
+            token_values[sep_index] = 0.0
+            masked_count += 1
+
+    for idx, token in enumerate(raw_tokens):
+        if repr(token).strip() in ("''", '""', "' '"):
+            token_values[idx] = 0.0
+            masked_count += 1
+            print(f"  Zeroed ghost token at position {idx}")
+
+    if masked_values.ndim > 1:
+        masked_values[0] = token_values
+    else:
+        masked_values = token_values
+
+    shap_values.values = masked_values
+    return masked_count
+
+
+def debug_print_shap_tokens(shap_values):
+    print("\nSHAP token debug")
+    print("-" * 72)
+    raw_tokens = shap_values.data[0].tolist()
+    raw_values = shap_values.values[0]
+    if raw_values.ndim == 2:
+        vals = raw_values[:, 1]  # TRUE class
+    else:
+        vals = raw_values
+
+    for i, (tok, val) in enumerate(zip(raw_tokens, vals)):
+        print(f"  [{i:3d}] repr={repr(tok):<30} value={float(val):+.6f}")
+
+
+def debug_print_top_shap_tokens(shap_values):
+    raw_tokens = shap_values.data[0].tolist()
+    raw_values = shap_values.values[0]
+    if raw_values.ndim == 2:
+        vals = raw_values[:, 1]
+    else:
+        vals = raw_values
+
+    sorted_idx = sorted(range(len(vals)), key=lambda i: abs(vals[i]), reverse=True)
+    print("TOP 5 HIGHEST SHAP VALUE TOKENS:")
+    for i in sorted_idx[:5]:
+        tok = raw_tokens[i]
+        print(
+            f"  [{i}] type={type(tok).__name__} repr={repr(tok)} "
+            f"len={len(str(tok))} value={float(vals[i]):+.6f}"
+        )
+
+
+def remove_ghost_tokens(shap_values):
+    raw_tokens = list(shap_values.data[0])
+    raw_values = shap_values.values[0]
+
+    keep_idx = [i for i, tok in enumerate(raw_tokens) if len(str(tok).strip()) > 0]
+
+    filtered_tokens = np.array([raw_tokens[i] for i in keep_idx])
+    filtered_values = raw_values[keep_idx]
+
+    return shap.Explanation(
+        values=filtered_values[np.newaxis, :],
+        data=np.array([filtered_tokens]),
+        feature_names=filtered_tokens,
+        base_values=shap_values.base_values,
+    )
 
 
 @dataclass
@@ -88,9 +195,11 @@ class TokenInspector:
     def predict_text(self, text: str) -> PredictionResult:
         probs = self.get_probs([text])[0]
         label = int(np.argmax(probs))
+        prob_true = float(probs[1])
         return PredictionResult(
             label=label,
             confidence=float(probs[label]),
+            logit=float(sp.special.logit(prob_true)),
             probabilities=probs,
         )
 
@@ -160,6 +269,40 @@ def print_prediction(prediction: PredictionResult, prefix: str):
     print(f"{prefix} probabilities: FAKE={prediction.probabilities[0]:.4f}, TRUE={prediction.probabilities[1]:.4f}")
 
 
+def format_signed(value: float) -> str:
+    return f"{value:+.4f}"
+
+
+def format_flip_flag(flipped: bool) -> str:
+    return "YES ✓" if flipped else "NO  ✗"
+
+
+def print_flip_summary(
+    replaced_token: str,
+    replacement_token: str,
+    before_prediction: PredictionResult,
+    after_prediction: PredictionResult,
+):
+    logit_shift = after_prediction.logit - before_prediction.logit
+    flipped = before_prediction.label != after_prediction.label
+
+    print("═" * 48)
+    print("FLIP SUMMARY")
+    print("═" * 48)
+    print(f'  Replacement       : "{replaced_token}" -> "{replacement_token}"')
+    print(
+        f"  Prediction before : {LABEL_NAMES[before_prediction.label]} "
+        f"(logit: {format_signed(before_prediction.logit)})"
+    )
+    print(
+        f"  Prediction after  : {LABEL_NAMES[after_prediction.label]} "
+        f"(logit: {format_signed(after_prediction.logit)})"
+    )
+    print(f"  Logit shift       : {format_signed(logit_shift)}")
+    print(f"  Label flipped     : {format_flip_flag(flipped)}")
+    print("═" * 48)
+
+
 def compute_text_statistics(
     tokenizer,
     text: str,
@@ -224,7 +367,7 @@ def save_shap_html(shap_values, html_out: str):
         ) from exc
     if not isinstance(html_fragment, str):
         html_fragment = str(html_fragment)
-    html = f"""<!DOCTYPE html>
+    html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -257,7 +400,7 @@ def save_shap_html(shap_values, html_out: str):
 </html>
 """
     with open(html_out, "w", encoding="utf-8") as handle:
-        handle.write(html)
+        handle.write(html_doc)
     print(f"Saved SHAP HTML to {os.path.abspath(html_out)}")
 
 
@@ -266,7 +409,7 @@ def replace_first_token(text: str, old: str, new: str) -> str:
     updated, count = pattern.subn(new, text, count=1)
     if count == 0:
         updated = text.replace(old, new, 1)
-    return normalize_text(updated)
+    return updated
 
 
 def start_html_server(html_out: str, host: str, port: int):
@@ -310,11 +453,17 @@ def inspect_once(
     html_out: str,
     prefix: str,
     true_label: Optional[int],
+    debug: bool = False,
 ):
     prediction = inspector.predict_text(text)
     print(f"\nText:\n{text}\n")
     print_prediction(prediction, prefix=prefix)
     shap_values = inspector.explain_text(text)
+    shap_values = remove_ghost_tokens(shap_values)
+    if debug:
+        debug_print_shap_tokens(shap_values)
+        debug_print_top_shap_tokens(shap_values)
+    masked_count = count_and_mask_boundary_special_tokens(shap_values)
     ranked_tokens = inspector.extract_ranked_tokens(shap_values)
     print_text_statistics(
         tokenizer=inspector.tokenizer,
@@ -322,6 +471,7 @@ def inspect_once(
         prediction=prediction,
         true_label=true_label,
     )
+    print(f"Masked {masked_count} special tokens from SHAP output")
     print_token_table(ranked_tokens)
     save_shap_html(shap_values, html_out)
     return prediction, shap_values, ranked_tokens
@@ -332,6 +482,7 @@ def interactive_flip_loop(
     original_text: str,
     html_out: str,
     true_label: Optional[int],
+    debug: bool = False,
 ):
     current_text = original_text
     history = []
@@ -353,6 +504,21 @@ def interactive_flip_loop(
             print("No change made; token not found.")
             continue
 
+        updated_text = normalize_whitespace(updated_text)
+        updated_text = collapse_spaces_around_punct(updated_text)
+        updated_text = updated_text.strip()
+
+        if len(updated_text) < 3:
+            print("Warning: replacement produced invalid text, skipping.")
+            continue
+
+        if debug:
+            print(f"Debug text repr: {updated_text!r}")
+
+        if updated_text == current_text:
+            print("No change made after whitespace normalization.")
+            continue
+
         current_text = updated_text
         new_prediction, _, _ = inspect_once(
             inspector,
@@ -360,15 +526,22 @@ def interactive_flip_loop(
             html_out,
             prefix="Modified",
             true_label=true_label,
+            debug=debug,
         )
+        flipped = previous_prediction.label != new_prediction.label
+        print_flip_summary(token_to_replace, replacement, previous_prediction, new_prediction)
         history.append(
             {
                 "replace": token_to_replace,
                 "with": replacement,
                 "before_label": previous_prediction.label,
                 "before_conf": previous_prediction.confidence,
+                "before_logit": previous_prediction.logit,
                 "after_label": new_prediction.label,
                 "after_conf": new_prediction.confidence,
+                "after_logit": new_prediction.logit,
+                "logit_shift": new_prediction.logit - previous_prediction.logit,
+                "flipped": flipped,
                 "text": current_text,
             }
         )
@@ -381,25 +554,32 @@ def interactive_flip_loop(
 
 
 def print_summary(history: List[dict], initial_prediction: PredictionResult, final_prediction: PredictionResult):
-    print("\nSummary")
-    print("=" * 72)
+    print("SESSION SUMMARY")
+    print("═" * 48)
     print(
-        f"Initial prediction: {LABEL_NAMES[initial_prediction.label]} ({initial_prediction.confidence:.4f})"
+        f"Initial prediction: {LABEL_NAMES[initial_prediction.label]} "
+        f"(logit: {format_signed(initial_prediction.logit)})"
     )
     print(
-        f"Final prediction:   {LABEL_NAMES[final_prediction.label]} ({final_prediction.confidence:.4f})"
+        f"Final prediction:   {LABEL_NAMES[final_prediction.label]} "
+        f"(logit: {format_signed(final_prediction.logit)})"
     )
     if not history:
         print("No replacements were made.")
         return
 
+    print()
+    print("Step  Replacement                Logit Before  Logit After   Shift    Flipped")
     for step, item in enumerate(history, start=1):
-        before_label = LABEL_NAMES[item["before_label"]]
-        after_label = LABEL_NAMES[item["after_label"]]
+        replacement_text = f'"{item["replace"]}" -> "{item["with"]}"'
         print(
-            f"{step}. \"{item['replace']}\" -> \"{item['with']}\" | "
-            f"{before_label} ({item['before_conf']:.4f}) -> {after_label} ({item['after_conf']:.4f})"
+            f"{step:<5} {replacement_text:<26} "
+            f"{format_signed(item['before_logit']):<13} "
+            f"{format_signed(item['after_logit']):<12} "
+            f"{format_signed(item['logit_shift']):<8} "
+            f"{format_flip_flag(item['flipped'])}"
         )
+    print("═" * 48)
 
 
 def main(args: argparse.Namespace):
@@ -417,12 +597,14 @@ def main(args: argparse.Namespace):
             args.html_out,
             prefix="Original",
             true_label=sample.true_label,
+            debug=args.debug,
         )
         final_text, history = interactive_flip_loop(
             inspector,
             text,
             args.html_out,
             true_label=sample.true_label,
+            debug=args.debug,
         )
         final_prediction = inspector.predict_text(final_text)
         print_summary(history, initial_prediction, final_prediction)
@@ -447,4 +629,5 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
     parser.add_argument("--serve_host", default="127.0.0.1", help="Host for the local HTML server")
     parser.add_argument("--serve_port", type=int, default=8765, help="Port for the local HTML server")
+    parser.add_argument("--debug", action="store_true", help="Print debug details such as repr(text) after edits")
     main(parser.parse_args())
