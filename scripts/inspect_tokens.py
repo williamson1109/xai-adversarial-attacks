@@ -266,7 +266,7 @@ def load_text(args: argparse.Namespace) -> LoadedSample:
 
 def print_prediction(prediction: PredictionResult, prefix: str):
     print(f"{prefix} prediction: {LABEL_NAMES[prediction.label]} ({prediction.confidence:.4f})")
-    print(f"{prefix} probabilities: FAKE={prediction.probabilities[0]:.4f}, TRUE={prediction.probabilities[1]:.4f}")
+    print(f"{prefix} confidence: FAKE={prediction.probabilities[0]:.4f}, TRUE={prediction.probabilities[1]:.4f}")
 
 
 def format_signed(value: float) -> str:
@@ -343,7 +343,7 @@ def print_text_statistics(
     print(f"  Word count        : {word_count}")
     print(f"  WordPiece tokens  : {wordpiece_count}  (incl. [CLS] and [SEP])")
     print(f"  Subword splits    : {subword_splits}   (words split into multiple tokens)")
-    print(f"  Prediction        : {LABEL_NAMES[prediction.label]} ({prediction.confidence:.4f})")
+    print(f"  Prediction        : {LABEL_NAMES[prediction.label]} (confidence: {prediction.confidence:.4f})")
     print(f"  True label        : {true_label_text}")
     print("═" * 51)
 
@@ -618,7 +618,11 @@ if __name__ == "__main__":
         description="Interactively inspect SHAP token importance and test manual token flips."
     )
     parser.add_argument("--model_dir", required=True, help="Directory containing the trained model and tokenizer")
-    parser.add_argument("--test_csv", required=True, help="CSV with statement and label columns")
+    parser.add_argument(
+        "--test_csv",
+        default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_test.csv",
+        help="CSV with statement and label columns",
+    )
     parser.add_argument("--sample_idx", type=int, default=0, help="Row index in the CSV to inspect")
     parser.add_argument("--text", default=None, help="Optional raw text to inspect instead of a CSV sample")
     parser.add_argument(

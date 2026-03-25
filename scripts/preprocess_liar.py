@@ -2,6 +2,7 @@ import argparse
 import pandas as pd
 import os
 from pathlib import Path
+from sklearn.model_selection import train_test_split
 
 # Actual LIAR dataset label encoding (verified against dataset distribution):
 # 0 = false
@@ -25,13 +26,25 @@ LABEL_NAMES = {
 }
 
 
-def fetch_liar_from_hf(split="train"):
+def fetch_liar_from_hf(split="all"):
     try:
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install the 'datasets' package: pip install datasets")
+    
     ds = load_dataset("liar")
-    df = pd.DataFrame(ds[split])
+    
+    if split == "all":
+        df = pd.concat([
+            pd.DataFrame(ds["train"]),
+            pd.DataFrame(ds["validation"]),
+            pd.DataFrame(ds["test"]),
+        ], ignore_index=True)
+        print(f"Loaded all splits combined: {len(df)} rows total")
+    else:
+        df = pd.DataFrame(ds[split])
+        print(f"Loaded '{split}' split: {len(df)} rows")
+    
     return df
 
 
@@ -134,13 +147,44 @@ def preprocess_liar(input_path, out_dir, from_hf=False, split="train"):
     df[["label", "statement", "original_label"]].to_csv(out_path, index=False)
     print(f"\nSaved to {out_path}")
 
+    train_df, test_df = train_test_split(
+        df,
+        test_size=0.2,
+        random_state=42,
+        stratify=df["label"],
+    )
+
+    train_path = os.path.join(out_dir, "liar_train.csv")
+    test_path = os.path.join(out_dir, "liar_test.csv")
+    train_df[["label", "statement", "original_label"]].to_csv(train_path, index=False)
+    test_df[["label", "statement", "original_label"]].to_csv(test_path, index=False)
+
+    train_counts = train_df["label"].value_counts()
+    test_counts = test_df["label"].value_counts()
+
+    print("\n" + "═" * 51)
+    print("TRAIN/TEST SPLIT")
+    print("═" * 51)
+    print(f"  Total samples  : {len(df)}")
+    print(
+        f"  Train samples  : {len(train_df)}  ({len(train_df) / len(df) * 100:.1f}%)  "
+        f"FAKE={train_counts.get(0, 0)}  TRUE={train_counts.get(1, 0)}"
+    )
+    print(
+        f"  Test samples   : {len(test_df)}  ({len(test_df) / len(df) * 100:.1f}%)  "
+        f"FAKE={test_counts.get(0, 0)}  TRUE={test_counts.get(1, 0)}"
+    )
+    print(f"  Saved train to : {train_path}")
+    print(f"  Saved test to  : {test_path}")
+    print("═" * 51)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess LIAR dataset for binary fake news classification.")
     parser.add_argument("--input",    required=True,  help="Path to raw LIAR CSV/TSV (ignored if --from_hf)")
     parser.add_argument("--out_dir",  required=True,  help="Output directory")
     parser.add_argument("--from_hf",  action="store_true", help="Fetch from HuggingFace instead of local file")
-    parser.add_argument("--split",    default="train", choices=["train", "validation", "test"],
+    parser.add_argument("--split", default="all", choices=["train", "validation", "test", "all"],
                         help="Dataset split to use when fetching from HuggingFace (default: train)")
     args = parser.parse_args()
     preprocess_liar(args.input, args.out_dir, from_hf=args.from_hf, split=args.split)

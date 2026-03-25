@@ -561,7 +561,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run SHAP-guided adversarial attacks against a DistilBERT fake news detector."
     )
-    parser.add_argument("--test_csv", required=True, help="CSV with statement and label columns")
+    parser.add_argument(
+        "--test_csv",
+        default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_test.csv",
+        help="CSV with statement and label columns",
+    )
     parser.add_argument("--model_dir", required=True, help="Directory containing the trained model and tokenizer")
     parser.add_argument("--n_samples", type=int, default=10, help="Number of samples to attack")
     parser.add_argument("--out_path", required=True, help="Path to save per-sample attack results as CSV")

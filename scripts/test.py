@@ -80,7 +80,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test_csv',   required=True, help='Path to processed LIAR test CSV')
+    parser.add_argument(
+        '--test_csv',
+        default='/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_test.csv',
+        help='Path to processed LIAR test CSV'
+    )
     parser.add_argument('--model_dir',  required=True, help='Directory with trained model and tokenizer')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for inference')
     args = parser.parse_args()

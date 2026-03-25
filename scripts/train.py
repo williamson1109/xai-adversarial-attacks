@@ -275,10 +275,11 @@ if __name__ == "__main__":
         description="Train DistilBERT fake-news classifier on LIAR (binary), "
                     "replicating Kozik et al. (2023) methodology."
     )
+    # The held-out test split must never be passed to this training script.
     parser.add_argument(
         "--train_csv",
-        default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_binary.csv",
-        help="Path to preprocessed binary LIAR CSV",
+        default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_train.csv",
+        help="Path to preprocessed LIAR training CSV",
     )
     parser.add_argument(
         "--out_dir",
