@@ -12,6 +12,7 @@ Pipeline per sample:
   5. Re-run classifier -> flipped? Record metrics and stop
   6. If not flipped -> re-run SHAP on modified text -> repeat
   7. Stop after --max_iter iterations or successful flip
+  8. Loop detection: stop if LLM produces a previously seen text
 
 Outputs two CSVs matching the LIAR Experiment Log Google Sheet structure:
   - llm_experiment_log.csv      -> LIAR Experiment Log tab
@@ -23,6 +24,8 @@ import os
 import re
 from datetime import datetime
 
+import time
+import time
 import anthropic
 import numpy as np
 import pandas as pd
@@ -32,6 +35,16 @@ import torch
 from Levenshtein import distance as levenshtein_distance
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+try:
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    import nltk
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+    nltk.download("averaged_perceptron_tagger", quiet=True)
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
 
 
 MAX_TOKENS = 250
@@ -76,6 +89,46 @@ def format_conf_change(before: float, after: float) -> str:
     change = (after - before) * 100
     sign = "+" if change >= 0 else ""
     return f"{sign}{change:.2f}%"
+
+
+# ---------------------------------------------------------------------------
+# Additional metrics utilities
+# ---------------------------------------------------------------------------
+
+def compute_bleu(original: str, modified: str) -> float:
+    """Compute sentence-level BLEU score between original and modified text."""
+    if not NLTK_AVAILABLE:
+        return -1.0
+    try:
+        ref = original.lower().split()
+        hyp = modified.lower().split()
+        smoothie = SmoothingFunction().method1
+        return round(sentence_bleu([ref], hyp, smoothing_function=smoothie), 4)
+    except Exception:
+        return -1.0
+
+
+def find_changed_tokens(original: str, modified: str) -> str:
+    """Identify which words changed between original and modified text."""
+    orig_words = original.lower().split()
+    mod_words  = modified.lower().split()
+    changed = []
+    for i, (o, m) in enumerate(zip(orig_words, mod_words)):
+        if o != m:
+            changed.append(f'"{o}"→"{m}"')
+    # handle length differences
+    if len(orig_words) > len(mod_words):
+        for w in orig_words[len(mod_words):]:
+            changed.append(f'"{w}"→[removed]')
+    elif len(mod_words) > len(orig_words):
+        for w in mod_words[len(orig_words):]:
+            changed.append(f'[added]→"{w}"')
+    return ", ".join(changed) if changed else "no change detected"
+
+
+def sentence_length_change(original: str, modified: str) -> int:
+    """Word count difference between modified and original (positive = longer)."""
+    return len(modified.split()) - len(original.split())
 
 
 # ---------------------------------------------------------------------------
@@ -164,40 +217,55 @@ def format_top_tokens(top_tokens: list) -> str:
 # LLM call
 # ---------------------------------------------------------------------------
 
-def call_claude(client, text: str, top_tokens: list) -> tuple:
-    """Returns (modified_text, input_tokens, output_tokens)."""
+def call_claude(client, text: str, top_tokens: list,
+                previous_texts: list = None,
+                max_retries: int = 5) -> tuple:
+    """Returns (modified_text, input_tokens, output_tokens).
+    Retries with exponential backoff on 529 overloaded errors."""
     token_list = "\n".join(
-        f'  - "{tok}" (importance: {score:+.4f})'
-        for tok, score in top_tokens
+        f'  - "{tok}"'
+        for tok, _ in top_tokens
     )
 
-    prompt = f"""You are assisting with adversarial NLP research on fake news detection.
+    # build history note to prevent loops
+    history_note = ""
+    if previous_texts:
+        history_note = "\nDo NOT reproduce any of these previously tried versions:\n"
+        history_note += "\n".join(f'  - "{t}"' for t in previous_texts)
 
-A fake news classifier has analyzed this statement:
-"{text}"
-
-SHAP explainability analysis identified these tokens as most influential
-in driving the current prediction (higher absolute value = more influential):
+    prompt = f"""Please rewrite the following sentence with minimal changes.
+Focus on finding natural alternatives for these specific words if possible:
 {token_list}
 
-Your task: produce a minimally modified version of the statement that:
-1. Changes 1-2 of the listed influential tokens to semantically similar alternatives
-2. Preserves the original meaning completely
-3. Is grammatically correct and fluent
-4. Sounds natural to a human reader
+Sentence: "{text}"
+{history_note}
+Rules:
+1. Keep the original meaning completely intact
+2. Only change 1-2 words maximum
+3. Ensure the result is grammatically correct and fluent
+4. Punctuation changes are allowed and do not affect meaning — removing or replacing periods, commas, or other punctuation is a valid modification
+5. Return ONLY the rewritten sentence, nothing else"""
 
-Return ONLY the modified sentence. No explanations, no quotes, no preamble."""
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            result = response.content[0].text.strip()
+            result = re.sub(r'^["\']|["\']$', '', result).strip()
+            return result, response.usage.input_tokens, response.usage.output_tokens
+        except Exception as e:
+            if "529" in str(e) or "overloaded" in str(e).lower():
+                wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                print(f"  API overloaded, retrying in {wait}s "
+                      f"(attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise  # re-raise non-overload errors immediately
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    result = response.content[0].text.strip()
-    result = re.sub(r'^["\']|["\']$', '', result).strip()
-    input_tokens  = response.usage.input_tokens
-    output_tokens = response.usage.output_tokens
-    return result, input_tokens, output_tokens
+    raise RuntimeError(f"API still overloaded after {max_retries} retries")
 
 
 # ---------------------------------------------------------------------------
@@ -243,48 +311,73 @@ def attack_sample(
     final_probs = orig_probs
     final_logit = orig_logit
 
+    # track all seen texts to detect loops
+    seen_texts = {text.strip()}
+
+    # track best text — closest to decision boundary (logit closest to 0)
+    best_text = text
+    best_distance_to_boundary = abs(orig_logit)
+    best_label = orig_label
+    best_conf = orig_conf
+    best_probs = orig_probs
+    best_logit = orig_logit
+
+    # final_text initialised to original — overwritten on flip or after loop
+    final_text = text
+
+    # patience counter — stop early if no improvement for N consecutive iterations
+    no_improvement_count = 0
+    max_no_improvement = 3
+
     for iteration in range(1, max_iter + 1):
-        current_label, current_conf, current_probs, current_logit = predict(
-            current_text, tokenizer, model, device
-        )
-
-        # check flip after first modification
-        if iteration > 1 and current_label != orig_label:
-            final_label = current_label
-            final_conf = current_conf
-            final_probs = current_probs
-            final_logit = current_logit
-            break
-
         # check budget before calling API
         if budget_tracker["spent"] >= budget_tracker["limit"]:
             print(f"\n  ⚠ Budget limit ${budget_tracker['limit']:.2f} reached — stopping.")
             break
 
-        # get top SHAP tokens for current text
+        # always attack from the best text found so far
+        current_text = best_text
+        current_label = best_label
+        current_logit = best_logit
+
+        # get top SHAP tokens for best text
         top_tokens = get_top_shap_tokens(
             explainer, current_text, current_label, top_n
         )
         impact_before = current_logit
 
-        # call LLM
+        # call LLM — pass seen texts to prevent loops
         try:
             modified_text, in_tok, out_tok = call_claude(
-                client, current_text, top_tokens
+                client, current_text, top_tokens,
+                previous_texts=list(seen_texts)
             )
             # track cost
             cost = (in_tok * COST_PER_INPUT_TOKEN) + (out_tok * COST_PER_OUTPUT_TOKEN)
-            budget_tracker["spent"]        += cost
-            budget_tracker["input_tokens"] += in_tok
+            budget_tracker["spent"]         += cost
+            budget_tracker["input_tokens"]  += in_tok
             budget_tracker["output_tokens"] += out_tok
-            budget_tracker["api_calls"]    += 1
+            budget_tracker["api_calls"]     += 1
+        except RuntimeError as e:
+            # all retries exhausted — skip iteration but continue
+            print(f"  Skipping iteration {iteration} after retries exhausted: {e}")
+            continue
         except Exception as e:
-            print(f"  LLM call failed at iteration {iteration}: {e}")
-            break
+            print(f"  Unexpected error at iteration {iteration}: {e}")
+            continue
 
+        # stop if no change
         if not modified_text or modified_text.strip() == current_text.strip():
             print(f"  No change from LLM at iteration {iteration}, stopping.")
             break
+
+        # stop if loop detected
+        if modified_text.strip() in seen_texts:
+            print(f"  Loop detected at iteration {iteration} — stopping.")
+            break
+
+        # register new text
+        seen_texts.add(modified_text.strip())
 
         # predict on modified text
         mod_label, mod_conf, mod_probs, mod_logit = predict(
@@ -292,37 +385,78 @@ def attack_sample(
         )
         impact_after = mod_logit
 
-        # record modification detail row
-        modification_detail_rows.append({
-            "Exp #": exp_num,
-            "Article Idx": sample_id,
-            "Sent #": iteration,
-            "Strategy": "LLM rewrite",
-            "Original Sentence": current_text,
-            "Modified Sentence": modified_text,
-            "Top Impact Words": format_top_tokens(top_tokens),
-            "Impact Before": f"{impact_before:.4f}",
-            "Impact After": f"{impact_after:.4f}",
-            "Notes/observations": "",
-        })
+        # update best text if this one is closer to decision boundary
+        distance_to_boundary = abs(mod_logit)
+        is_new_best = distance_to_boundary < best_distance_to_boundary
+        if is_new_best:
+            best_distance_to_boundary = distance_to_boundary
+            best_text = modified_text
+            best_label = mod_label
+            best_conf = mod_conf
+            best_probs = mod_probs
+            best_logit = mod_logit
+            no_improvement_count = 0
+            print(f"  ✓ New best at iteration {iteration} "
+                  f"(logit: {mod_logit:+.4f}, distance to boundary: {distance_to_boundary:.4f})")
+        else:
+            no_improvement_count += 1
+            if no_improvement_count >= max_no_improvement:
+                print(f"  No improvement for {max_no_improvement} consecutive iterations — stopping early.")
+                # still record this modification detail row before breaking
+                modification_detail_rows.append({
+                    "Exp #": exp_num,
+                    "Article Idx": sample_id,
+                    "Sent #": iteration,
+                    "Strategy": "LLM rewrite",
+                    "Original Sentence": current_text,
+                    "Modified Sentence": modified_text,
+                    "Top Impact Words": format_top_tokens(top_tokens),
+                    "Impact Before": f"{impact_before:.4f}",
+                    "Impact After": f"{impact_after:.4f}",
+                    "Notes/observations": f"stopped: no improvement for {max_no_improvement} iter",
+                })
+                break
 
-        current_text = modified_text
-        final_label = mod_label
-        final_conf = mod_conf
-        final_probs = mod_probs
-        final_logit = mod_logit
+        # record modification detail row (only if we didn't already record in early stop)
+        if not (no_improvement_count >= max_no_improvement):
+            modification_detail_rows.append({
+                "Exp #": exp_num,
+                "Article Idx": sample_id,
+                "Sent #": iteration,
+                "Strategy": "LLM rewrite",
+                "Original Sentence": current_text,
+                "Modified Sentence": modified_text,
+                "Top Impact Words": format_top_tokens(top_tokens),
+                "Impact Before": f"{impact_before:.4f}",
+                "Impact After": f"{impact_after:.4f}",
+                "Notes/observations": "← new best" if is_new_best else f"best=logit {best_logit:+.4f}",
+            })
 
+        # check flip immediately after predicting on modified text
         if mod_label != orig_label:
+            final_label = mod_label
+            final_conf = mod_conf
+            final_probs = mod_probs
+            final_logit = mod_logit
+            final_text = modified_text
+            print(f"  🎯 Flip detected at iteration {iteration}!")
             break
+    else:
+        # no flip — use best text found as final result
+        final_label = best_label
+        final_conf = best_conf
+        final_probs = best_probs
+        final_logit = best_logit
+        final_text = best_text
 
-    # final metrics
+    # final metrics — compare original to best/flipped text
+    iterations_run = len(modification_detail_rows)
     metrics = compute_metrics(
         text, orig_probs, orig_label,
-        current_text, final_probs, final_label
+        final_text, final_probs, final_label
     )
     flipped = final_label != orig_label
     correct_after = final_label == true_label
-    iterations_run = len(modification_detail_rows)
 
     # build experiment log row matching Google Sheet columns exactly
     experiment_log_row = {
@@ -339,8 +473,8 @@ def attack_sample(
         "Orig P(Fake)": format_pct(orig_probs[0]),
         "Strategy": "LLM rewrite",
         "Sent # Modified": iterations_run,
-        "# Words changed": count_word_diff(text, current_text),
-        "# Sents Changed": count_sentence_diff(text, current_text),
+        "# Words changed": count_word_diff(text, final_text),
+        "# Sents Changed": count_sentence_diff(text, final_text),
         "New Pred": LABEL_NAMES[final_label],
         "New Conf %": format_pct(final_conf),
         "New P(Real)": format_pct(final_probs[1]),
@@ -348,6 +482,13 @@ def attack_sample(
         "Flipped?": "YES" if flipped else "NO",
         "Correct After?": "YES" if correct_after else "NO",
         "Conf Change %": format_conf_change(orig_conf, final_conf),
+        "Orig Logit":          f"{orig_logit:+.4f}",
+        "Final Logit":         f"{final_logit:+.4f}",
+        "Logit Shift":         f"{final_logit - orig_logit:+.4f}",
+        "BLEU Score":          compute_bleu(text, final_text),
+        "Changed Token(s)":    find_changed_tokens(text, final_text),
+        "Length Change":       sentence_length_change(text, final_text),
+        "Orig Correct?":       "YES" if orig_label == true_label else "NO",
         "Notes / Observations": (
             f"LLM attack | {iterations_run} iter | "
             f"AE={metrics['AE']} CI={metrics['CI']} "
@@ -431,13 +572,27 @@ def main(args):
 
     # define output paths before loop so incremental save works
     os.makedirs(args.out_dir, exist_ok=True)
-    exp_log_path   = os.path.join(args.out_dir, "llm_experiment_log.csv")
+    exp_log_path    = os.path.join(args.out_dir, "llm_experiment_log.csv")
     mod_detail_path = os.path.join(args.out_dir, "llm_modification_detail.csv")
 
     # run attacks
     exp_log_rows = []
     mod_detail_rows = []
-    exp_num = args.start_exp_num
+
+    # auto-detect starting exp number from existing log if it exists
+    if os.path.exists(exp_log_path):
+        try:
+            existing = pd.read_csv(exp_log_path)
+            if not existing.empty and "Exp #" in existing.columns:
+                exp_num = int(existing["Exp #"].max()) + 1
+                print(f"Auto-detected start exp num: {exp_num} (continuing from existing log)")
+            else:
+                exp_num = args.start_exp_num
+        except Exception:
+            exp_num = args.start_exp_num
+    else:
+        exp_num = args.start_exp_num
+    print(f"Starting from experiment #{exp_num}")
 
     for sample_id, row in tqdm(
         sample_df.iterrows(), total=len(sample_df), desc="LLM attack"
@@ -482,7 +637,7 @@ def main(args):
         pd.DataFrame(mod_detail_rows).to_csv(mod_detail_path, index=False)
 
     # build final dataframes
-    exp_log_df  = pd.DataFrame(exp_log_rows)
+    exp_log_df    = pd.DataFrame(exp_log_rows)
     mod_detail_df = pd.DataFrame(mod_detail_rows)
 
     print(f"\nExperiment log saved to     : {exp_log_path}")
@@ -534,8 +689,8 @@ if __name__ == "__main__":
         help="Number of samples to attack (default: 50)"
     )
     parser.add_argument(
-        "--max_iter", type=int, default=5,
-        help="Max LLM iterations per sample (default: 5)"
+        "--max_iter", type=int, default=10,
+        help="Max LLM iterations per sample (default: 10)"
     )
     parser.add_argument(
         "--top_n", type=int, default=5,
