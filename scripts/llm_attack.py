@@ -202,20 +202,26 @@ def get_top_shap_tokens(explainer, text: str, predicted_label: int, top_n: int =
         cleaned = clean_token(str(token))
         if not cleaned:
             continue
-        score = float(value) if predicted_label == 0 else -float(value)
-        token_scores.append((cleaned, score))
+        # negative SHAP = pushes toward FAKE, positive SHAP = pushes toward TRUE
+        token_scores.append((cleaned, float(value)))
 
     token_scores.sort(key=lambda x: abs(x[1]), reverse=True)
     return token_scores[:top_n]
 
 
 def format_top_tokens(top_tokens: list) -> str:
-    return ", ".join(f"{tok} ({score:+.3f})" for tok, score in top_tokens)
+    return ", ".join(
+        f"{tok} ({score:+.3f})"
+        for tok, score in top_tokens
+    )
 
 
 # ---------------------------------------------------------------------------
 # LLM call
 # ---------------------------------------------------------------------------
+
+PUNCTUATION_TOKENS = {".", ",", "!", "?", ";", ":", "-", "'", '"', "(", ")", "..."}
+
 
 def call_claude(client, text: str, top_tokens: list,
                 previous_texts: list = None,
@@ -227,6 +233,22 @@ def call_claude(client, text: str, top_tokens: list,
         for tok, _ in top_tokens
     )
 
+    # check if any top tokens are punctuation — if so, give explicit instruction
+    # for TRUE predictions: target positive SHAP punct (pushing toward TRUE)
+    # for FAKE predictions: target negative SHAP punct (pushing toward FAKE)
+    top_token_strings = [tok.strip() for tok, _ in top_tokens]
+    punct_tokens = [t for t in top_token_strings if t in PUNCTUATION_TOKENS]
+    punct_note = ""
+    if punct_tokens:
+        punct_list = ", ".join(f'"{p}"' for p in punct_tokens)
+        punct_note = (
+            f"\nIMPORTANT: The following punctuation marks are among the most "
+            f"influential tokens: {punct_list}. "
+            f"You MUST try removing or replacing at least one of them. "
+            f"For example, remove a trailing period, replace a comma with a semicolon, "
+            f"or remove an exclamation mark. This is the most effective modification."
+        )
+
     # build history note to prevent loops
     history_note = ""
     if previous_texts:
@@ -236,14 +258,14 @@ def call_claude(client, text: str, top_tokens: list,
     prompt = f"""Please rewrite the following sentence with minimal changes.
 Focus on finding natural alternatives for these specific words if possible:
 {token_list}
-
+{punct_note}
 Sentence: "{text}"
 {history_note}
 Rules:
 1. Keep the original meaning completely intact
-2. Only change 1-2 words maximum
+2. Only change 1-2 words or punctuation marks maximum
 3. Ensure the result is grammatically correct and fluent
-4. Punctuation changes are allowed and do not affect meaning — removing or replacing periods, commas, or other punctuation is a valid modification
+4. Punctuation changes (removing or replacing periods, commas, etc.) are valid and do not affect meaning
 5. Return ONLY the rewritten sentence, nothing else"""
 
     for attempt in range(max_retries):
@@ -325,10 +347,6 @@ def attack_sample(
     # final_text initialised to original — overwritten on flip or after loop
     final_text = text
 
-    # patience counter — stop early if no improvement for N consecutive iterations
-    no_improvement_count = 0
-    max_no_improvement = 3
-
     for iteration in range(1, max_iter + 1):
         # check budget before calling API
         if budget_tracker["spent"] >= budget_tracker["limit"]:
@@ -395,42 +413,22 @@ def attack_sample(
             best_conf = mod_conf
             best_probs = mod_probs
             best_logit = mod_logit
-            no_improvement_count = 0
             print(f"  ✓ New best at iteration {iteration} "
                   f"(logit: {mod_logit:+.4f}, distance to boundary: {distance_to_boundary:.4f})")
-        else:
-            no_improvement_count += 1
-            if no_improvement_count >= max_no_improvement:
-                print(f"  No improvement for {max_no_improvement} consecutive iterations — stopping early.")
-                # still record this modification detail row before breaking
-                modification_detail_rows.append({
-                    "Exp #": exp_num,
-                    "Article Idx": sample_id,
-                    "Sent #": iteration,
-                    "Strategy": "LLM rewrite",
-                    "Original Sentence": current_text,
-                    "Modified Sentence": modified_text,
-                    "Top Impact Words": format_top_tokens(top_tokens),
-                    "Impact Before": f"{impact_before:.4f}",
-                    "Impact After": f"{impact_after:.4f}",
-                    "Notes/observations": f"stopped: no improvement for {max_no_improvement} iter",
-                })
-                break
 
-        # record modification detail row (only if we didn't already record in early stop)
-        if not (no_improvement_count >= max_no_improvement):
-            modification_detail_rows.append({
-                "Exp #": exp_num,
-                "Article Idx": sample_id,
-                "Sent #": iteration,
-                "Strategy": "LLM rewrite",
-                "Original Sentence": current_text,
-                "Modified Sentence": modified_text,
-                "Top Impact Words": format_top_tokens(top_tokens),
-                "Impact Before": f"{impact_before:.4f}",
-                "Impact After": f"{impact_after:.4f}",
-                "Notes/observations": "← new best" if is_new_best else f"best=logit {best_logit:+.4f}",
-            })
+        # record modification detail row
+        modification_detail_rows.append({
+            "Exp #": exp_num,
+            "Article Idx": sample_id,
+            "Sent #": iteration,
+            "Strategy": "LLM rewrite",
+            "Original Sentence": current_text,
+            "Modified Sentence": modified_text,
+            "Top Impact Words": format_top_tokens(top_tokens),
+            "Impact Before": f"{impact_before:.4f}",
+            "Impact After": f"{impact_after:.4f}",
+            "Notes/observations": "← new best" if is_new_best else f"best=logit {best_logit:+.4f}",
+        })
 
         # check flip immediately after predicting on modified text
         if mod_label != orig_label:
@@ -575,24 +573,54 @@ def main(args):
     exp_log_path    = os.path.join(args.out_dir, "llm_experiment_log.csv")
     mod_detail_path = os.path.join(args.out_dir, "llm_modification_detail.csv")
 
-    # run attacks
+    # run attacks — load existing rows first so incremental save preserves them
     exp_log_rows = []
     mod_detail_rows = []
 
     # auto-detect starting exp number from existing log if it exists
+    # and load existing rows so incremental save preserves them
     if os.path.exists(exp_log_path):
         try:
             existing = pd.read_csv(exp_log_path)
             if not existing.empty and "Exp #" in existing.columns:
                 exp_num = int(existing["Exp #"].max()) + 1
+                exp_log_rows = existing.to_dict("records")
                 print(f"Auto-detected start exp num: {exp_num} (continuing from existing log)")
+                print(f"Loaded {len(exp_log_rows)} existing experiment rows")
             else:
                 exp_num = args.start_exp_num
         except Exception:
             exp_num = args.start_exp_num
     else:
         exp_num = args.start_exp_num
+
+    if os.path.exists(mod_detail_path):
+        try:
+            existing_mod = pd.read_csv(mod_detail_path)
+            if not existing_mod.empty:
+                mod_detail_rows = existing_mod.to_dict("records")
+                print(f"Loaded {len(mod_detail_rows)} existing modification detail rows")
+        except Exception:
+            pass
+
     print(f"Starting from experiment #{exp_num}")
+
+    # skip samples already attacked in previous runs
+    if exp_log_rows:
+        already_attacked = set(str(row["Article Idx"]) for row in exp_log_rows)
+        original_count = len(sample_df)
+        sample_df = sample_df[~sample_df.index.astype(str).isin(already_attacked)]
+        skipped = original_count - len(sample_df)
+        if skipped > 0:
+            print(f"Skipping {skipped} already-attacked samples ({len(sample_df)} remaining)")
+        # if all samples already attacked, sample new ones from the rest of the dataset
+        if len(sample_df) == 0:
+            print("All sampled articles already attacked — sampling from remaining unseen articles...")
+            remaining_df = df[~df.index.astype(str).isin(already_attacked)]
+            sample_df = remaining_df.sample(
+                n=min(args.n_samples, len(remaining_df)), random_state=args.seed
+            )
+            print(f"Sampled {len(sample_df)} new unseen articles")
 
     for sample_id, row in tqdm(
         sample_df.iterrows(), total=len(sample_df), desc="LLM attack"
@@ -632,7 +660,7 @@ def main(args):
             f"({budget_tracker['api_calls']} API calls)"
         )
 
-        # save incrementally after every sample in case of crash
+        # save incrementally — exp_log_rows and mod_detail_rows already include existing data
         pd.DataFrame(exp_log_rows).to_csv(exp_log_path, index=False)
         pd.DataFrame(mod_detail_rows).to_csv(mod_detail_path, index=False)
 
