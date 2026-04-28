@@ -92,9 +92,12 @@ def compute_metrics(eval_pred):
 
 def build_model(model_name: str, device: str):
     """
-    Build DistilBERT with a classification head.
-    Following Kozik et al., the DistilBERT base is FROZEN —
-    only the classification head is trained.
+    Build a sequence classification model.
+    - DistilBERT: encoder is FROZEN, only classification head is trained
+      (matches Kozik et al. transfer-learning setup)
+    - RoBERTa (and others): full fine-tuning — all parameters trainable.
+      RoBERTa requires encoder gradients to converge on this task;
+      freezing the encoder causes class collapse (predicts TRUE only).
     """
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
@@ -103,11 +106,18 @@ def build_model(model_name: str, device: str):
         label2id=LABEL2ID,
     )
 
-    # Freeze the DistilBERT encoder — train classification head only
-    # (matches Kozik et al. transfer-learning setup)
-    for name, param in model.named_parameters():
-        if "classifier" not in name and "pre_classifier" not in name:
-            param.requires_grad = False
+    is_distilbert = "distilbert" in model_name.lower()
+
+    if is_distilbert:
+        # Freeze encoder — train classification head only
+        HEAD_KEYWORDS = ("classifier", "pre_classifier")
+        for name, param in model.named_parameters():
+            if not any(kw in name for kw in HEAD_KEYWORDS):
+                param.requires_grad = False
+        print("DistilBERT: encoder frozen, training classification head only.")
+    else:
+        # Full fine-tuning for RoBERTa and other models
+        print(f"{model_name}: full fine-tuning (all parameters trainable).")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
@@ -181,6 +191,7 @@ def run_fold(
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}\n")
+    print(f"Model: {args.model}\n")
 
     df = load_data(args.train_csv)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -272,10 +283,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train DistilBERT fake-news classifier on LIAR (binary), "
-                    "replicating Kozik et al. (2023) methodology."
+        description="Train a fake-news classifier on LIAR (binary), "
+                    "replicating Kozik et al. (2023) methodology. "
+                    "Supports DistilBERT and RoBERTa via --model argument."
     )
-    # The held-out test split must never be passed to this training script.
     parser.add_argument(
         "--train_csv",
         default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_train.csv",
@@ -289,11 +300,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         default="distilbert-base-uncased",
-        help="HuggingFace model name (default: distilbert-base-uncased)",
+        help="HuggingFace model name (default: distilbert-base-uncased). "
+             "Use 'roberta-base' for RoBERTa.",
     )
-    parser.add_argument("--epochs",     type=int,   default=3,
+    parser.add_argument("--epochs",     type=int, default=3,
                         help="Number of training epochs (default: 3)")
-    parser.add_argument("--batch_size", type=int,   default=16,
+    parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size (default: 16)")
     args = parser.parse_args()
     main(args)
