@@ -224,7 +224,8 @@ PUNCTUATION_TOKENS = {".", ",", "!", "?", ";", ":", "-", "'", '"', "(", ")", "..
 
 def call_claude(client, text: str, top_tokens: list,
                 previous_texts: list = None,
-                max_retries: int = 5) -> tuple:
+                max_retries: int = 5,
+                current_logit: float = None) -> tuple:
     """Returns (modified_text, input_tokens, output_tokens).
     Retries with exponential backoff on 529 overloaded errors."""
     token_list = "\n".join(
@@ -232,21 +233,29 @@ def call_claude(client, text: str, top_tokens: list,
         for tok, _ in top_tokens
     )
 
-    # check if any top tokens are punctuation — if so, give explicit instruction
-    # for TRUE predictions: target positive SHAP punct (pushing toward TRUE)
-    # for FAKE predictions: target negative SHAP punct (pushing toward FAKE)
+    # check if any top tokens are punctuation
     top_token_strings = [tok.strip() for tok, _ in top_tokens]
     punct_tokens = [t for t in top_token_strings if t in PUNCTUATION_TOKENS]
     punct_note = ""
     if punct_tokens:
         punct_list = ", ".join(f'"{p}"' for p in punct_tokens)
-        punct_note = (
-            f"\nIMPORTANT: The following punctuation marks are among the most "
-            f"influential tokens: {punct_list}. "
-            f"You MUST try removing or replacing at least one of them. "
-            f"For example, remove a trailing period, replace a comma with a semicolon, "
-            f"or remove an exclamation mark. This is the most effective modification."
-        )
+        # escalate urgency when very close to decision boundary
+        near_boundary = current_logit is not None and abs(current_logit) < 0.05
+        if near_boundary:
+            punct_note = (
+                f"\nCRITICAL: The prediction is extremely close to flipping. "
+                f"The punctuation marks {punct_list} are the most influential tokens. "
+                f"You MUST remove or replace at least one of them in this rewrite. "
+                f"Simply removing a comma or period is enough — do it now."
+            )
+        else:
+            punct_note = (
+                f"\nIMPORTANT: The following punctuation marks are among the most "
+                f"influential tokens: {punct_list}. "
+                f"You MUST try removing or replacing at least one of them. "
+                f"For example, remove a trailing period, replace a comma with a semicolon, "
+                f"or remove an exclamation mark. This is the most effective modification."
+            )
 
     # build history note to prevent loops
     history_note = ""
@@ -363,11 +372,12 @@ def attack_sample(
         )
         impact_before = current_logit
 
-        # call LLM — pass seen texts to prevent loops
+        # call LLM — pass seen texts to prevent loops and logit for boundary detection
         try:
             modified_text, in_tok, out_tok = call_claude(
                 client, current_text, top_tokens,
-                previous_texts=list(seen_texts)
+                previous_texts=list(seen_texts),
+                current_logit=best_logit,
             )
             # track cost
             cost = (in_tok * COST_PER_INPUT_TOKEN) + (out_tok * COST_PER_OUTPUT_TOKEN)
@@ -549,9 +559,20 @@ def main(args):
     # load data
     df = pd.read_csv(args.test_csv, usecols=["statement", "label"])
     df = df.dropna(subset=["statement", "label"]).reset_index(drop=True)
-    sample_df = df.sample(
-        n=min(args.n_samples, len(df)), random_state=args.seed
-    )
+
+    # if reference log provided, attack the same articles in the same order
+    if args.reference_log and os.path.exists(args.reference_log):
+        ref_df = pd.read_csv(args.reference_log)
+        ref_indices = ref_df["Article Idx"].astype(int).tolist()
+        sample_df = df.loc[df.index.isin(ref_indices)].copy()
+        # preserve the exact order from the reference log
+        sample_df = sample_df.loc[[i for i in ref_indices if i in sample_df.index]]
+        print(f"Reference log loaded — attacking {len(sample_df)} articles in same order as reference run.")
+    else:
+        sample_df = df.sample(
+            n=min(args.n_samples, len(df)), random_state=args.seed
+        )
+
     print(
         f"Attacking {len(sample_df)} samples "
         f"(max {args.max_iter} iterations each)\n"
@@ -567,17 +588,20 @@ def main(args):
         "api_calls":     0,
     }
 
-    # define output paths before loop so incremental save works
+    # define output paths — use model-specific filenames to avoid overwriting
     os.makedirs(args.out_dir, exist_ok=True)
-    exp_log_path    = os.path.join(args.out_dir, "llm_experiment_log.csv")
-    mod_detail_path = os.path.join(args.out_dir, "llm_modification_detail.csv")
+    model_tag = os.path.basename(os.path.dirname(args.model_dir))  # e.g. "roberta_model"
+    exp_log_path    = os.path.join(args.out_dir, f"llm_experiment_log_{model_tag}.csv")
+    mod_detail_path = os.path.join(args.out_dir, f"llm_modification_detail_{model_tag}.csv")
+    print(f"Output files:")
+    print(f"  {exp_log_path}")
+    print(f"  {mod_detail_path}")
 
     # run attacks — load existing rows first so incremental save preserves them
     exp_log_rows = []
     mod_detail_rows = []
 
     # auto-detect starting exp number from existing log if it exists
-    # and load existing rows so incremental save preserves them
     if os.path.exists(exp_log_path):
         try:
             existing = pd.read_csv(exp_log_path)
@@ -612,14 +636,6 @@ def main(args):
         skipped = original_count - len(sample_df)
         if skipped > 0:
             print(f"Skipping {skipped} already-attacked samples ({len(sample_df)} remaining)")
-        # if all samples already attacked, sample new ones from the rest of the dataset
-        if len(sample_df) == 0:
-            print("All sampled articles already attacked — sampling from remaining unseen articles...")
-            remaining_df = df[~df.index.astype(str).isin(already_attacked)]
-            sample_df = remaining_df.sample(
-                n=min(args.n_samples, len(remaining_df)), random_state=args.seed
-            )
-            print(f"Sampled {len(sample_df)} new unseen articles")
 
     for sample_id, row in tqdm(
         sample_df.iterrows(), total=len(sample_df), desc="LLM attack"
@@ -738,5 +754,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start_exp_num", type=int, default=1,
         help="Starting experiment number for log (default: 1)"
+    )
+    parser.add_argument(
+        "--reference_log", default=None,
+        help="Path to a previous experiment log CSV — attacks the same articles in the same order"
     )
     main(parser.parse_args())
