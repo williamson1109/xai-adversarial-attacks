@@ -22,6 +22,7 @@ Outputs two CSVs matching the LIAR Experiment Log Google Sheet structure:
 import argparse
 import os
 import re
+import json
 from datetime import datetime
 
 import time
@@ -31,6 +32,7 @@ import pandas as pd
 import scipy as sp
 import shap
 import torch
+import torch.nn as nn
 from Levenshtein import distance as levenshtein_distance
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -48,6 +50,53 @@ except ImportError:
 
 MAX_TOKENS = 250
 LABEL_NAMES = {0: "Fake", 1: "Real"}
+
+# ---------------------------------------------------------------------------
+# TextCNN model definition (must match train_textcnn.py)
+# ---------------------------------------------------------------------------
+
+PAD_TOKEN = "<PAD>"
+UNK_TOKEN = "<UNK>"
+
+
+def textcnn_tokenize(text: str) -> list:
+    """Simple tokenizer matching train_textcnn.py."""
+    text = str(text).lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return text.split()
+
+
+def textcnn_text_to_indices(text: str, vocab: dict, max_len: int = MAX_TOKENS) -> list:
+    tokens = textcnn_tokenize(text)[:max_len]
+    indices = [vocab.get(t, vocab[UNK_TOKEN]) for t in tokens]
+    indices += [vocab[PAD_TOKEN]] * (max_len - len(indices))
+    return indices
+
+
+class TextCNN(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_filters, filter_sizes,
+                 num_classes, dropout, pretrained_embeddings=None,
+                 freeze_embeddings=True):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        if pretrained_embeddings is not None:
+            self.embedding.weight.data.copy_(
+                torch.from_numpy(pretrained_embeddings)
+            )
+        if freeze_embeddings:
+            self.embedding.weight.requires_grad = False
+        self.convs = nn.ModuleList([
+            nn.Conv1d(embed_dim, num_filters, kernel_size=fs)
+            for fs in filter_sizes
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(num_filters * len(filter_sizes), num_classes)
+
+    def forward(self, x):
+        embedded = self.embedding(x).permute(0, 2, 1)
+        pooled = [torch.relu(conv(embedded)).max(dim=2).values
+                  for conv in self.convs]
+        return self.fc(self.dropout(torch.cat(pooled, dim=1)))
 SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>", ""}
 
 # Approximate cost per token (Claude Sonnet 4)
@@ -135,36 +184,84 @@ def sentence_length_change(original: str, modified: str) -> int:
 # ---------------------------------------------------------------------------
 
 def load_model(model_dir: str, device: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
-    model.eval()
-    return tokenizer, model
+    """Load either a HuggingFace transformer or a TextCNN model."""
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # detect TextCNN by presence of filter_sizes in config
+    if "filter_sizes" in config:
+        # TextCNN
+        vocab_path = os.path.join(model_dir, "vocab.json")
+        with open(vocab_path) as f:
+            vocab = json.load(f)
+        embeddings = np.load(os.path.join(model_dir, "embeddings.npy"))
+        model = TextCNN(
+            vocab_size=config["vocab_size"],
+            embed_dim=config["embed_dim"],
+            num_filters=config["num_filters"],
+            filter_sizes=config["filter_sizes"],
+            num_classes=config["num_classes"],
+            dropout=config["dropout"],
+            pretrained_embeddings=embeddings,
+            freeze_embeddings=True,
+        ).to(device)
+        state = torch.load(
+            os.path.join(model_dir, "textcnn_weights.pt"),
+            map_location=device
+        )
+        model.load_state_dict(state)
+        model.eval()
+        print("Loaded TextCNN model.")
+        return ("textcnn", vocab, config), model
+    else:
+        # HuggingFace transformer
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+        model.eval()
+        print("Loaded transformer model.")
+        return ("transformer", tokenizer, None), model
 
 
-def get_probs(texts, tokenizer, model, device, batch_size=8):
+def get_probs(texts, model_info, model, device, batch_size=8):
     if isinstance(texts, np.ndarray):
         texts = texts.tolist()
     texts = [str(t) for t in texts]
     all_probs = []
+
+    model_type = model_info[0]
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        encoded = tokenizer(
-            batch,
-            return_tensors="pt",
-            truncation=True,
-            padding="max_length",
-            max_length=MAX_TOKENS,
-        )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-        with torch.no_grad():
-            logits = model(**encoded).logits
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+        if model_type == "transformer":
+            tokenizer = model_info[1]
+            encoded = tokenizer(
+                batch,
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=MAX_TOKENS,
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            with torch.no_grad():
+                logits = model(**encoded).logits
+        else:
+            # TextCNN
+            vocab = model_info[1]
+            indices = [textcnn_text_to_indices(t, vocab, MAX_TOKENS) for t in batch]
+            x = torch.tensor(indices, dtype=torch.long).to(device)
+            with torch.no_grad():
+                logits = model(x)
+
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
         all_probs.append(probs)
+
     return np.vstack(all_probs)
 
 
-def predict(text, tokenizer, model, device):
-    probs = get_probs([text], tokenizer, model, device)[0]
+def predict(text, model_info, model, device):
+    probs = get_probs([text], model_info, model, device)[0]
     label = int(np.argmax(probs))
     logit = float(sp.special.logit(float(probs[1])))
     return label, float(probs[label]), probs, logit
@@ -174,11 +271,22 @@ def predict(text, tokenizer, model, device):
 # SHAP utilities
 # ---------------------------------------------------------------------------
 
-def build_explainer(tokenizer, model, device):
+def build_explainer(model_info, model, device):
+    """Build SHAP explainer — uses HuggingFace tokenizer for transformers,
+    word-level text masker for TextCNN."""
+    model_type = model_info[0]
+
     def predict_fn(texts):
-        probs = get_probs(texts, tokenizer, model, device)
+        probs = get_probs(texts, model_info, model, device)
         return sp.special.logit(probs[:, 1])
-    return shap.Explainer(predict_fn, tokenizer)
+
+    if model_type == "transformer":
+        tokenizer = model_info[1]
+        return shap.Explainer(predict_fn, tokenizer)
+    else:
+        # TextCNN: use word-level text masker
+        masker = shap.maskers.Text(r"\s+")  # split on whitespace
+        return shap.Explainer(predict_fn, masker)
 
 
 def clean_token(token: str) -> str:
@@ -192,7 +300,12 @@ def clean_token(token: str) -> str:
 
 
 def get_top_shap_tokens(explainer, text: str, predicted_label: int, top_n: int = 5):
-    shap_values = explainer([text], fixed_context=1)
+    # fixed_context=1 is only supported for HuggingFace tokenizer-based explainers
+    try:
+        shap_values = explainer([text], fixed_context=1)
+    except TypeError:
+        shap_values = explainer([text])
+
     raw_tokens = list(shap_values.data[0])
     raw_values = shap_values.values[0]
 
@@ -321,7 +434,7 @@ def attack_sample(
     sample_id: int,
     text: str,
     true_label: int,
-    tokenizer,
+    model_info,
     model,
     device,
     explainer,
@@ -332,7 +445,7 @@ def attack_sample(
     budget_tracker: dict,
 ) -> tuple:
     orig_label, orig_conf, orig_probs, orig_logit = predict(
-        text, tokenizer, model, device
+        text, model_info, model, device
     )
     current_text = text
     modification_detail_rows = []
@@ -408,7 +521,7 @@ def attack_sample(
 
         # predict on modified text
         mod_label, mod_conf, mod_probs, mod_logit = predict(
-            modified_text, tokenizer, model, device
+            modified_text, model_info, model, device
         )
         impact_after = mod_logit
 
@@ -472,7 +585,7 @@ def attack_sample(
         "Article Idx": sample_id,
         "True Label": LABEL_NAMES[true_label],
         "# Sentences": count_sentences(text),
-        "# Tokens\n(full)": len(tokenizer.tokenize(text)) + 2,
+        "# Tokens\n(full)": len(model_info[1].tokenize(text)) + 2 if model_info[0] == "transformer" else len(textcnn_tokenize(text)),
         "# Words (full)": count_words(text),
         "Orig Pred": LABEL_NAMES[orig_label],
         "Orig Conf %": format_pct(orig_conf),
@@ -541,11 +654,11 @@ def main(args):
     today = datetime.now().strftime("%d.%m.%Y")
 
     # load model
-    tokenizer, model = load_model(args.model_dir, device)
+    model_info, model = load_model(args.model_dir, device)
 
     # build SHAP explainer
     print("Building SHAP explainer...")
-    explainer = build_explainer(tokenizer, model, device)
+    explainer = build_explainer(model_info, model, device)
 
     # load Anthropic client
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -653,7 +766,7 @@ def main(args):
             sample_id=sample_id,
             text=text,
             true_label=true_label,
-            tokenizer=tokenizer,
+            model_info=model_info,
             model=model,
             device=device,
             explainer=explainer,
