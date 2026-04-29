@@ -29,40 +29,6 @@ Raw LIAR data
                         → Adversarial examples + metrics
 ```
 
----
-
-## Repository Structure
-
-```
-.
-├── data/
-│   ├── glove/                  # GloVe embeddings (for TextCNN)
-│   └── processed/
-│       ├── liar_binary.csv     # Full binary dataset (8,090 samples)
-│       ├── liar_train.csv      # Training split (6,472 samples)
-│       └── liar_test.csv       # Held-out test split (1,618 samples)
-├── models/
-│   ├── liar_model/             # Trained DistilBERT
-│   ├── roberta_model/          # Trained RoBERTa
-│   └── textcnn_model/          # Trained TextCNN
-├── results/
-│   ├── llm_attack/             # DistilBERT attack results
-│   ├── llm_attack_roberta/     # RoBERTa attack results
-│   └── analysis/               # POS analysis, visualisations
-├── scripts/
-│   ├── preprocess_liar.py      # Data preprocessing
-│   ├── train.py                # Train DistilBERT or RoBERTa
-│   ├── test.py                 # Evaluate transformer models
-│   ├── train_textcnn.py        # Train TextCNN (Kim 2014)
-│   ├── test_textcnn.py         # Evaluate TextCNN
-│   ├── inspect_tokens.py       # Interactive SHAP token inspection
-│   ├── xai_attack_shap.py      # Rule-based SHAP attack (Kozik et al.)
-│   └── llm_attack.py           # LLM-guided adversarial attack pipeline
-└── requirements.txt
-```
-
----
-
 ## Setup
 
 This project runs on the NTNU IDUN HPC cluster (SLURM, GPU nodes). It should work on any Linux system with CUDA available.
@@ -168,7 +134,7 @@ python scripts/inspect_tokens.py \
 
 ### 5. Rule-Based SHAP Attack (Kozik et al. replication)
 
-Replicates the four rule-based attack strategies from Kozik et al. (2023): SWR, SWI, SS, and BT.
+Replicates the four rule-based attack strategies from Kozik et al. (2024): SWR, SWI, SS, and BT.
 
 ```bash
 python scripts/xai_attack_shap.py \
@@ -265,7 +231,7 @@ Final dataset: **8,090 samples** (44% FAKE, 56% TRUE).
 
 ## Architecture Details
 
-**DistilBERT** — `distilbert-base-uncased`, frozen encoder, classification head only. Replicates Kozik et al. (2023). max_length=250, batch_size=16, epochs=3.
+**DistilBERT** — `distilbert-base-uncased`, frozen encoder, classification head only. Replicates Kozik et al. (2024). max_length=250, batch_size=16, epochs=3.
 
 **RoBERTa** — `roberta-base`, full fine-tuning (frozen encoder causes class collapse for RoBERTa). max_length=250, batch_size=16, epochs=3.
 
