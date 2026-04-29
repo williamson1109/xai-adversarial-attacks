@@ -4,7 +4,7 @@
 > Martin Rustad & William Son Fagerstrøm  
 > Supervisor: Özlem Özgöbek
 
-This repository contains the full pipeline for our master's thesis *"Using XAI for Adversarial Attacks on Fake News Detection"*. We replicate and extend the SHAP-guided adversarial attack framework from [Kozik et al. (2023)](https://doi.org/10.1016/j.future.2023.04.002) on the [LIAR dataset](https://huggingface.co/datasets/liar), and compare attack effectiveness across three model architectures: DistilBERT, RoBERTa, and TextCNN.
+This repository contains the full pipeline for our master's thesis *"Using XAI for Adversarial Attacks on Fake News Detection"*. We replicate and extend the SHAP-guided adversarial attack framework from [Kozik et al. (2024)](https://www.sciencedirect.com/science/article/pii/S0167404823005096) on the [LIAR dataset](https://huggingface.co/datasets/liar), and compare attack effectiveness across three model architectures: DistilBERT, RoBERTa, and TextCNN.
 
 ---
 
@@ -280,6 +280,6 @@ Final dataset: **8,090 samples** (44% FAKE, 56% TRUE).
 If you use this code, please cite:
 
 ```
-Kozik, R. et al. (2023). When explainability turns into a threat — 
+Kozik, R. et al. (2024). When explainability turns into a threat — 
 using XAI to fool a fake-news detector. Future Generation Computer Systems.
 ```
