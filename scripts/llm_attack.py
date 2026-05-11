@@ -157,20 +157,32 @@ def compute_bleu(original: str, modified: str) -> float:
 
 
 def find_changed_tokens(original: str, modified: str) -> str:
-    """Identify which words changed between original and modified text."""
-    orig_words = original.lower().split()
-    mod_words  = modified.lower().split()
+    """Identify which words changed using diff alignment."""
+    import difflib
+    orig_words = original.split()
+    mod_words  = modified.split()
+
+    matcher = difflib.SequenceMatcher(None, orig_words, mod_words)
     changed = []
-    for i, (o, m) in enumerate(zip(orig_words, mod_words)):
-        if o != m:
-            changed.append(f'"{o}"→"{m}"')
-    # handle length differences
-    if len(orig_words) > len(mod_words):
-        for w in orig_words[len(mod_words):]:
-            changed.append(f'"{w}"→[removed]')
-    elif len(mod_words) > len(orig_words):
-        for w in mod_words[len(orig_words):]:
-            changed.append(f'[added]→"{w}"')
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'replace':
+            orig_chunk = orig_words[i1:i2]
+            mod_chunk  = mod_words[j1:j2]
+            for o, m in zip(orig_chunk, mod_chunk):
+                changed.append(f'"{o}"→"{m}"')
+            # handle length mismatch within replace block
+            for o in orig_chunk[len(mod_chunk):]:
+                changed.append(f'"{o}"→[removed]')
+            for m in mod_chunk[len(orig_chunk):]:
+                changed.append(f'[added]→"{m}"')
+        elif tag == 'delete':
+            for o in orig_words[i1:i2]:
+                changed.append(f'"{o}"→[removed]')
+        elif tag == 'insert':
+            for m in mod_words[j1:j2]:
+                changed.append(f'[added]→"{m}"')
+
     return ", ".join(changed) if changed else "no change detected"
 
 
