@@ -1,12 +1,14 @@
 import argparse
 import getpass
 import http.server
+import importlib
 import os
 import re
 import socket
 import socketserver
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -28,6 +30,12 @@ class PredictionResult:
     confidence: float
     logit: float
     probabilities: np.ndarray
+
+
+@dataclass
+class LoadedSample:
+    text: str
+    true_label: Optional[int]
 
 
 def normalize_text(text: str) -> str:
@@ -107,7 +115,7 @@ def debug_print_shap_tokens(shap_values):
     raw_tokens = shap_values.data[0].tolist()
     raw_values = shap_values.values[0]
     if raw_values.ndim == 2:
-        vals = raw_values[:, 1]  # TRUE class
+        vals = raw_values[:, 1]
     else:
         vals = raw_values
 
@@ -148,12 +156,6 @@ def remove_ghost_tokens(shap_values):
         feature_names=filtered_tokens,
         base_values=shap_values.base_values,
     )
-
-
-@dataclass
-class LoadedSample:
-    text: str
-    true_label: Optional[int]
 
 
 class TokenInspector:
@@ -311,7 +313,7 @@ def compute_text_statistics(
     word_count = sum(1 for token in whitespace_tokens if re.search(r"\w", token))
 
     wordpiece_tokens = tokenizer.tokenize(text)
-    wordpiece_count = len(wordpiece_tokens) + 2  # [CLS] and [SEP]
+    wordpiece_count = len(wordpiece_tokens) + 2
 
     subword_splits = 0
     for token in whitespace_tokens:
@@ -365,8 +367,10 @@ def save_shap_html(shap_values, html_out: str):
             "Saving the SHAP HTML visualization requires matplotlib. "
             "Install it with `pip install matplotlib` or `pip install -r requirements.txt`."
         ) from exc
+
     if not isinstance(html_fragment, str):
         html_fragment = str(html_fragment)
+
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -382,12 +386,12 @@ def save_shap_html(shap_values, html_out: str):
       color: #111111;
     }}
     .container {{
-      max-width: 1200px;
+      max-width: 1600px;
       margin: 0 auto;
     }}
     h1 {{
-      font-size: 24px;
-      margin-bottom: 16px;
+      font-size: 28px;
+      margin-bottom: 20px;
     }}
   </style>
 </head>
@@ -399,9 +403,63 @@ def save_shap_html(shap_values, html_out: str):
 </body>
 </html>
 """
+
     with open(html_out, "w", encoding="utf-8") as handle:
         handle.write(html_doc)
+
     print(f"Saved SHAP HTML to {os.path.abspath(html_out)}")
+
+
+def format_png_out_path(png_out: str, prefix: str) -> str:
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "_", prefix.lower())
+
+    if "{prefix}" in png_out:
+        return png_out.format(prefix=safe_prefix)
+
+    return png_out
+
+
+def export_shap_html_to_png(
+    html_out: str,
+    png_out: str,
+    screenshot_width: int = 1800,
+    screenshot_height: int = 500,
+    screenshot_scale: float = 3.0,
+):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "Could not export PNG because Playwright is not installed.\n"
+            "Install it with:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        )
+        return
+
+    html_path = Path(html_out).resolve()
+    png_path = Path(png_out).resolve()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox"])
+        page = browser.new_page(
+            viewport={"width": screenshot_width, "height": screenshot_height},
+            device_scale_factor=screenshot_scale,
+        )
+
+        page.goto(html_path.as_uri())
+        page.wait_for_timeout(2000)
+
+        container = page.locator(".container")
+        if container.count() > 0:
+            container.screenshot(path=str(png_path))
+        else:
+            page.screenshot(path=str(png_path), full_page=True)
+
+        browser.close()
+
+    print(f"Saved high-resolution SHAP PNG to {png_path}")
 
 
 def replace_first_token(text: str, old: str, new: str) -> str:
@@ -414,7 +472,7 @@ def replace_first_token(text: str, old: str, new: str) -> str:
 
 def start_html_server(html_out: str, host: str, port: int):
     serve_dir = os.path.abspath(os.path.dirname(html_out) or ".")
-    handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(  # noqa: E731
+    handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
         *args,
         directory=serve_dir,
         **kwargs,
@@ -454,26 +512,47 @@ def inspect_once(
     prefix: str,
     true_label: Optional[int],
     debug: bool = False,
+    png_out: Optional[str] = None,
+    screenshot_width: int = 1800,
+    screenshot_height: int = 500,
+    screenshot_scale: float = 3.0,
 ):
     prediction = inspector.predict_text(text)
     print(f"\nText:\n{text}\n")
     print_prediction(prediction, prefix=prefix)
+
     shap_values = inspector.explain_text(text)
     shap_values = remove_ghost_tokens(shap_values)
+
     if debug:
         debug_print_shap_tokens(shap_values)
         debug_print_top_shap_tokens(shap_values)
+
     masked_count = count_and_mask_boundary_special_tokens(shap_values)
     ranked_tokens = inspector.extract_ranked_tokens(shap_values)
+
     print_text_statistics(
         tokenizer=inspector.tokenizer,
         text=text,
         prediction=prediction,
         true_label=true_label,
     )
+
     print(f"Masked {masked_count} special tokens from SHAP output")
     print_token_table(ranked_tokens)
+
     save_shap_html(shap_values, html_out)
+
+    if png_out:
+        actual_png_out = format_png_out_path(png_out, prefix)
+        export_shap_html_to_png(
+            html_out=html_out,
+            png_out=actual_png_out,
+            screenshot_width=screenshot_width,
+            screenshot_height=screenshot_height,
+            screenshot_scale=screenshot_scale,
+        )
+
     return prediction, shap_values, ranked_tokens
 
 
@@ -483,6 +562,10 @@ def interactive_flip_loop(
     html_out: str,
     true_label: Optional[int],
     debug: bool = False,
+    png_out: Optional[str] = None,
+    screenshot_width: int = 1800,
+    screenshot_height: int = 500,
+    screenshot_scale: float = 3.0,
 ):
     current_text = original_text
     history = []
@@ -500,6 +583,7 @@ def interactive_flip_loop(
 
         previous_prediction = inspector.predict_text(current_text)
         updated_text = replace_first_token(current_text, token_to_replace, replacement)
+
         if updated_text == current_text:
             print("No change made; token not found.")
             continue
@@ -520,6 +604,7 @@ def interactive_flip_loop(
             continue
 
         current_text = updated_text
+
         new_prediction, _, _ = inspect_once(
             inspector,
             current_text,
@@ -527,9 +612,21 @@ def interactive_flip_loop(
             prefix="Modified",
             true_label=true_label,
             debug=debug,
+            png_out=png_out,
+            screenshot_width=screenshot_width,
+            screenshot_height=screenshot_height,
+            screenshot_scale=screenshot_scale,
         )
+
         flipped = previous_prediction.label != new_prediction.label
-        print_flip_summary(token_to_replace, replacement, previous_prediction, new_prediction)
+
+        print_flip_summary(
+            token_to_replace,
+            replacement,
+            previous_prediction,
+            new_prediction,
+        )
+
         history.append(
             {
                 "replace": token_to_replace,
@@ -553,7 +650,11 @@ def interactive_flip_loop(
     return current_text, history
 
 
-def print_summary(history: List[dict], initial_prediction: PredictionResult, final_prediction: PredictionResult):
+def print_summary(
+    history: List[dict],
+    initial_prediction: PredictionResult,
+    final_prediction: PredictionResult,
+):
     print("SESSION SUMMARY")
     print("═" * 48)
     print(
@@ -564,6 +665,7 @@ def print_summary(history: List[dict], initial_prediction: PredictionResult, fin
         f"Final prediction:   {LABEL_NAMES[final_prediction.label]} "
         f"(logit: {format_signed(final_prediction.logit)})"
     )
+
     if not history:
         print("No replacements were made.")
         return
@@ -579,17 +681,20 @@ def print_summary(history: List[dict], initial_prediction: PredictionResult, fin
             f"{format_signed(item['logit_shift']):<8} "
             f"{format_flip_flag(item['flipped'])}"
         )
+
     print("═" * 48)
 
 
 def main(args: argparse.Namespace):
     sample = load_text(args)
     text = sample.text
+
     inspector = TokenInspector(args.model_dir, args.batch_size)
     server, _ = start_html_server(args.html_out, args.serve_host, args.serve_port)
 
     print(f"Using device: {inspector.device}")
     print_browser_instructions(args.html_out, args.serve_host, args.serve_port)
+
     try:
         initial_prediction, _, _ = inspect_once(
             inspector,
@@ -598,16 +703,27 @@ def main(args: argparse.Namespace):
             prefix="Original",
             true_label=sample.true_label,
             debug=args.debug,
+            png_out=args.png_out,
+            screenshot_width=args.screenshot_width,
+            screenshot_height=args.screenshot_height,
+            screenshot_scale=args.screenshot_scale,
         )
+
         final_text, history = interactive_flip_loop(
             inspector,
             text,
             args.html_out,
             true_label=sample.true_label,
             debug=args.debug,
+            png_out=args.png_out,
+            screenshot_width=args.screenshot_width,
+            screenshot_height=args.screenshot_height,
+            screenshot_scale=args.screenshot_scale,
         )
+
         final_prediction = inspector.predict_text(final_text)
         print_summary(history, initial_prediction, final_prediction)
+
     finally:
         server.shutdown()
         server.server_close()
@@ -617,21 +733,80 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Interactively inspect SHAP token importance and test manual token flips."
     )
-    parser.add_argument("--model_dir", required=True, help="Directory containing the trained model and tokenizer")
+
+    parser.add_argument(
+        "--model_dir",
+        required=True,
+        help="Directory containing the trained model and tokenizer",
+    )
     parser.add_argument(
         "--test_csv",
         default="/cluster/home/williasf/xai-adversarial-attacks/data/processed/liar_test.csv",
         help="CSV with statement and label columns",
     )
-    parser.add_argument("--sample_idx", type=int, default=0, help="Row index in the CSV to inspect")
-    parser.add_argument("--text", default=None, help="Optional raw text to inspect instead of a CSV sample")
+    parser.add_argument(
+        "--sample_idx",
+        type=int,
+        default=0,
+        help="Row index in the CSV to inspect",
+    )
+    parser.add_argument(
+        "--text",
+        default=None,
+        help="Optional raw text to inspect instead of a CSV sample",
+    )
     parser.add_argument(
         "--html_out",
         default="shap_inspection.html",
         help="Path to save the SHAP HTML visualization",
     )
-    parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
-    parser.add_argument("--serve_host", default="127.0.0.1", help="Host for the local HTML server")
-    parser.add_argument("--serve_port", type=int, default=8765, help="Port for the local HTML server")
-    parser.add_argument("--debug", action="store_true", help="Print debug details such as repr(text) after edits")
+    parser.add_argument(
+        "--png_out",
+        default=None,
+        help=(
+            "Optional path to save a high-resolution PNG of the SHAP visualization. "
+            "Use {prefix} to save separate files, e.g. figures/shap_{prefix}.png."
+        ),
+    )
+    parser.add_argument(
+        "--screenshot_width",
+        type=int,
+        default=1800,
+        help="Viewport width used when exporting the SHAP HTML to PNG.",
+    )
+    parser.add_argument(
+        "--screenshot_height",
+        type=int,
+        default=500,
+        help="Viewport height used when exporting the SHAP HTML to PNG.",
+    )
+    parser.add_argument(
+        "--screenshot_scale",
+        type=float,
+        default=3.0,
+        help="Device scale factor used for high-resolution PNG export.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Inference batch size",
+    )
+    parser.add_argument(
+        "--serve_host",
+        default="127.0.0.1",
+        help="Host for the local HTML server",
+    )
+    parser.add_argument(
+        "--serve_port",
+        type=int,
+        default=8765,
+        help="Port for the local HTML server",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug details such as repr(text) after edits",
+    )
+
     main(parser.parse_args())

@@ -12,3 +12,4 @@ sentencepiece
 nlpaug
 python-Levenshtein
 matplotlib
+playwright
